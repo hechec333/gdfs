@@ -1,0 +1,33 @@
+version: '3.0'
+networks: 
+  backend: 
+    driver: bridge
+services:
+    {{range $index,$value := .Cluster.Master.Nodes}}
+    master-{{$value.Name}}:
+        build: 
+            dockerfile: Dockerfile
+        container_name: {{$value.Name}}
+        hostname: {{$value.Name}}
+        environment:
+            - GDFS_UUID={{$value.Uuid}}
+        networks:
+            - backend
+        ports:
+            - "{{$value.Port}}:{{$value.Port}}"
+        command: ["-r","m"]
+    {{end}}
+    {{range $index,$value := .Cluster.Cs.Nodes}}
+    chunkserver-{{$value.Name}}:
+        build: 
+            dockerfile: Dockerfile
+        container_name: {{$value.Name}}
+        hostname: {{$value.Name}}
+        environment:
+            - GDFS_UUID={{$value.Uuid}}
+        networks:
+            - backend
+        ports:
+            - "{{$value.Port}}:{{$value.Port}}"
+        command: ["-r","c"]
+    {{end}}

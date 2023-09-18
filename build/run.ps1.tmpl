@@ -1,0 +1,22 @@
+function utime {
+    Write-Host -NoNewline ("[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "]")
+}
+
+Write-Host ">>> start gdfs clusters configuration"
+utime
+cd cmd
+{{range $index,$value := .Cluster.Master.Nodes}}
+Write-Host ">>> start running Master-{{$value.Name}}"
+Start-Process -NoNewWindow "go" -ArgumentList "run main.go -r m -u {{$value.Uuid}}"
+{{end}}
+
+utime
+Start-Sleep -Seconds 1
+
+
+{{range $index,$value := .Cluster.Cs.Nodes}}
+Write-Host ">>> start running Master-{{$value.Name}}"
+Start-Process -NoNewWindow "go" -ArgumentList "run main.go -r m -u {{$value.Uuid}}"
+{{end}}
+
+Write-Host ">>> finish running gdfs clusters"

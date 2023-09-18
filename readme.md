@@ -29,17 +29,17 @@
 
 
 - `本地运行`
-- 生成脚本文件
-  ```sh
-  cd build && go run build.go script
-  ```
-  - 运行脚本文件
-  ```sh
-  #windows
-  .\run.ps1
-  #linux
-  chmod +x run.sh && ./run.sh
+  - 生成脚本文件
+    ```sh
+    cd build && go run build.go script
     ```
+    - 运行脚本文件
+    ```sh
+    #windows
+    .\run.ps1
+    #linux
+    chmod +x run.sh && ./run.sh
+      ```
 
 - `docker运行`
   - 生成配置文件
