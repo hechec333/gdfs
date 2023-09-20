@@ -8,13 +8,13 @@ cd cmd
 utime
 {{range $index,$value := .Cluster.Master.Nodes}}
 echo ">>> start running Master-{{$value.Name}}"
-go run cmd/main.go -r m -u {{$value.Uuid}} &
+go run main.go -r m -u {{$value.Uuid}} &
 {{end}}
 utime
 sleep 1s
 {{range $index,$value := .Cluster.Cs.Nodes}}
 echo ">>> start running ChunkServer-{{$value.Name}}"
-go run cmd/main.go -r c -u {{$value.Uuid}} &
+go run main.go -r c -u {{$value.Uuid}} &
 {{end}}
 
 echo ">>> finish running gdfs clusters"
