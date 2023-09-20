@@ -12,6 +12,6 @@ COPY . /app/gdfs
 
 RUN go mod download
 
-RUN go build main.go -o dameon
+RUN go build cmd/main.go -o dameon
 
-ENTRYPOINT [ "dameon" ]
+ENTRYPOINT [ "./dameon" ]

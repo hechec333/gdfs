@@ -33,7 +33,7 @@ func SetPath(s string) {
 	path = s + "/" + path
 }
 
-var path = "../config.xml"
+var path = "config.xml"
 
 func newConfiguration() *Configuartion {
 	cc := Configuartion{}
