@@ -383,7 +383,8 @@ func (cc *ChunkControlor) RemoveChunk(do *wal.LogOpLet, handles []types.ChunkHan
 				if err != nil {
 					panic(err)
 				}
-				log.Println("lose all replica of %v", handle)
+				//log.Println("lose all replica of %v", handle)
+				common.LWarn("lose all replica of %v", handle)
 				for _, v := range cc.Files {
 					if index := v.HasChunk(handle); index != -1 {
 						delete(v.Handles, index)
@@ -454,7 +455,7 @@ func (cc *ChunkControlor) GetLease(do *wal.LogOpLet, handle types.ChunkHandle) (
 				err := rpc.Call(v, "ChunkServer.CheckReplicaVersion", &arg, &reply)
 				mu.Lock()
 				defer mu.Unlock()
-				if err == nil && reply.IsStale == false {
+				if err == nil && !reply.IsStale {
 					newList = append(newList, peer)
 				} else {
 					log.Printf("stale replica %v from %v", handle, peer)
@@ -468,10 +469,7 @@ func (cc *ChunkControlor) GetLease(do *wal.LogOpLet, handle types.ChunkHandle) (
 		ck.Lock()
 		defer ck.Unlock()
 		ck.Replicas = make([]types.Addr, 0)
-		for _, v := range newList {
-			ck.Replicas = append(ck.Replicas, v)
-		}
-
+		ck.Replicas = append(ck.Replicas, newList...)
 		if len(ck.Replicas) < common.MinChunks {
 			cc.Lock()
 			cc.replicaNeedList = append(cc.replicaNeedList, handle)

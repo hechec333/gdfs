@@ -146,17 +146,19 @@ func (cs *ChunkServer) GoBackGroundTask() {
 func (cs *ChunkServer) GoHeartbeat() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	redirect := false
+	common.LTrace("heart beat to master,current master addr", cs.masters[cs.who])
 	var err error
 	for {
 		select {
 		case <-cs.shutdown:
 			return
 		case <-ticker.C:
-			err, redirect = cs.heartbeat()
-			if err != nil || redirect {
+			if !redirect {
+				err, redirect = cs.heartbeat()
+			} else {
 				err = cs.discoverMaster()
 				if err == ErrNotFoundMaster {
-					log.Printf("[WARN] Lose Master Info")
+					common.LTrace("lose communication to master err %v,spining retry", err)
 					redirect = true
 				} else {
 					redirect = false
@@ -166,10 +168,12 @@ func (cs *ChunkServer) GoHeartbeat() {
 	}
 }
 func (cs *ChunkServer) discoverMaster() error {
-	mu := sync.Mutex{}
-	calls := 0
-	lastTerm := 0
-	wait := make(chan struct{})
+	var (
+		mu       = sync.Mutex{}
+		calls    = 0
+		lastTerm = 0
+		wait     = make(chan struct{})
+	)
 	for v := range cs.masters {
 		go func(peer int) {
 			var reply types.MasterCheckReply
@@ -188,6 +192,10 @@ func (cs *ChunkServer) discoverMaster() error {
 				wait <- struct{}{}
 			}
 			calls++
+
+			if err != nil {
+				common.LWarn("call rpc checkmaster error %v", err)
+			}
 		}(v)
 	}
 	for {
@@ -312,6 +320,7 @@ func (cs *ChunkServer) persiteMetaData() error {
 	}
 
 	//log.Infof("Server %v : store metadata len: %v", cs.address, len(metas))
+	common.LInfo("Server %v : store metadata len: %v", cs.address, len(metas))
 	enc := gob.NewEncoder(file)
 	err = enc.Encode(metas)
 
@@ -333,7 +342,7 @@ func (cs *ChunkServer) RPCCheckReplicaVersion(args types.CheckReplicaVersionArg,
 		ck.version++
 		reply.IsStale = false
 	} else {
-		//log.Warningf("%v : stale chunk %v", cs.address, args.Handle)
+		common.LWarn("Server %v : stale chunk %v", cs.address, args.Handle)
 		ck.abandoned = true
 		reply.IsStale = true
 	}
@@ -345,18 +354,14 @@ func (cs *ChunkServer) RPCForwardData(args *types.ForwardDataArg, reply *types.F
 		return fmt.Errorf("data %v already exists", args.DataID)
 	}
 
-	//log.Infof("Server %v : get data %v", cs.address, args.DataID)
-	//log.Warning(cs.address, "data 2 ", args.DataID)
+	common.LInfo("Server %v : get data %v", cs.address, args.DataID)
 	cs.dl.Set(args.DataID, args.Data)
-	//log.Warning(cs.address, "data 3 ", args.DataID)
-
 	if len(args.ChainOrder) > 0 {
 		next := args.ChainOrder[0]
 		args.ChainOrder = args.ChainOrder[1:]
 		err := xrpc.Call(next, "ChunkServer.RPCForwardData", args, reply)
 		return err
 	}
-	//log.Warning(cs.address, "data 4 ", args.DataID)
 
 	return nil
 }
@@ -364,10 +369,10 @@ func (cs *ChunkServer) RPCForwardData(args *types.ForwardDataArg, reply *types.F
 func (cs *ChunkServer) RPCCreateChunk(args *types.CreateChunkArg, reply *types.CreateChunkReply) error {
 	cs.lock.Lock()
 	defer cs.lock.Unlock()
-	//log.Infof("Server %v : create chunk %v", cs.address, args.Handle)
-
+	common.LInfo("Server %v : create chunk %v", cs.address, args.Handle)
 	if _, ok := cs.chunk[args.Handle]; ok {
 		//log.Warning("[ignored] recreate a chunk in RPCCreateChunk")
+		common.LWarn("[ignored] recreate a chunk in RPCCreateChunk %v", args.Handle)
 		return nil // TODO : error handle
 		//return fmt.Errorf("Chunk %v already exists", args.Handle)
 	}
@@ -469,9 +474,6 @@ func (cs *ChunkServer) RPCWriteChunk(args *types.WriteChunkArg, reply *types.Wri
 		return err
 	}
 
-	// extend lease
-	//cs.pendingLeaseExtensions.Add(handle)
-
 	return nil
 }
 func (cs *ChunkServer) RPCAppendChunk(args *types.AppendChunkArg, reply *types.AppendChunkReply) error {
@@ -513,7 +515,7 @@ func (cs *ChunkServer) RPCAppendChunk(args *types.AppendChunkArg, reply *types.A
 		mutation := &Mutation{mtype, data, offset}
 
 		//log.Infof("Primary %v : append chunk %v version %v", cs.address, args.DataID.Handle, version)
-
+		common.LInfo("Primary %v : append chunk %v", cs.address, args.DataID.Handle, cs.chunk[args.DataID.Handle].version)
 		// apply to local
 		wait := make(chan error, 1)
 		go func() {
@@ -552,9 +554,6 @@ func (cs *ChunkServer) RPCAppendChunk(args *types.AppendChunkArg, reply *types.A
 		return err
 	}
 
-	// extend lease
-	//cs.pendingLeaseExtensions.Add(handle)
-
 	return nil
 }
 
@@ -573,7 +572,7 @@ func (cs *ChunkServer) RPCApplyMutation(args *types.ApplyMutationArg, reply *typ
 	}
 
 	//log.Infof("Server %v : get mutation to chunk %v version %v", cs.address, handle, args.Version)
-
+	common.LInfo("Server %v : get mutation to chunk %v ", cs.address, handle)
 	mutation := &Mutation{
 		mtype:  args.Mtype,
 		data:   data,
@@ -601,7 +600,7 @@ func (cs *ChunkServer) RPCSendCopy(args *types.SendCopyArg, reply *types.SendCop
 	ck.RLock()
 	defer ck.RUnlock()
 
-	//log.Infof("Server %v : Send copy of %v to %v", cs.address, handle, args.Address)
+	common.LInfo("Server %v : Send copy of %v to %v", cs.address, handle, args.Address)
 	data := make([]byte, ck.length)
 	_, err := cs.readChunk(handle, 0, data)
 	if err != nil {
@@ -633,14 +632,12 @@ func (cs *ChunkServer) RPCApplyCopy(args *types.ApplyCopyArg, reply *types.Apply
 	ck.Lock()
 	defer ck.Unlock()
 
-	//log.Infof("Server %v : Apply copy of %v", cs.address, handle)
-
+	common.LInfo("Server %v : Apply copy of %v", cs.address, handle)
 	ck.version = args.Version
 	err := cs.writeChunk(handle, args.Data, 0, true)
 	if err != nil {
 		return err
 	}
-	//log.Infof("Server %v : Apply done", cs.address)
 	return nil
 }
 
@@ -661,6 +658,7 @@ func (cs *ChunkServer) writeChunk(handle types.ChunkHandle, data []byte, offset 
 	}
 
 	//log.Infof("Server %v : write to chunk %v at %v len %v", cs.address, handle, offset, len(data))
+	common.LInfo("Server %v : write to chunk %v at %v len %v", cs.address, handle, offset, len(data))
 	filename := path.Join(cs.rootDir, fmt.Sprintf("chunk%v.chk", handle))
 	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, FilePerm)
 	if err != nil {
@@ -685,7 +683,7 @@ func (cs *ChunkServer) readChunk(handle types.ChunkHandle, offset int, data []by
 		return -1, err
 	}
 	defer f.Close()
-
+	common.LTrace("Server %v : read chunk %v at %v len %v", cs.address, handle, offset, len(data))
 	//log.Infof("Server %v : read chunk %v at %v len %v", cs.address, handle, offset, len(data))
 	return f.ReadAt(data, int64(offset))
 }
@@ -724,6 +722,7 @@ func (cs *ChunkServer) doMutation(handle types.ChunkHandle, m *Mutation) error {
 		ck := cs.chunk[handle]
 		cs.lock.RUnlock()
 		//log.Warningf("%v abandon chunk %v", cs.address, handle)
+		common.LWarn("%v abandon chunk %v", cs.address, handle)
 		ck.abandoned = true
 		return err
 	}

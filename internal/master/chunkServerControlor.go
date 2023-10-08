@@ -103,6 +103,7 @@ func (csc *ChunkServerControlor) CopyChunk(handle types.ChunkHandle) (from, to t
 	//调度策略
 	k := rand.Intn(len(owns))
 	i := rand.Intn(len(notowns))
+	common.LInfo("copy server %v to %v", owns[k], notowns[i])
 	return owns[k], notowns[i], nil
 }
 
@@ -110,7 +111,7 @@ func (csc *ChunkServerControlor) CopyChunk(handle types.ChunkHandle) (from, to t
 func (csc *ChunkServerControlor) ScheduleActiveServers(num int) ([]types.Addr, error) {
 	all := []types.Addr{}
 	csc.RLock()
-	for s, _ := range csc.servers {
+	for s := range csc.servers {
 		all = append(all, s)
 	}
 	csc.RUnlock()
@@ -122,7 +123,7 @@ func (csc *ChunkServerControlor) ScheduleActiveServers(num int) ([]types.Addr, e
 	for _, v := range seq {
 		selects = append(selects, all[v])
 	}
-
+	common.LInfo("new sharding to %v", selects)
 	return selects, nil
 }
 
@@ -142,7 +143,7 @@ func (csc *ChunkServerControlor) GetDeadServers() []types.Addr {
 func (csc *ChunkServerControlor) RemoveServer(server types.Addr) []types.ChunkHandle {
 	csc.Lock()
 	defer csc.Unlock()
-
+	common.LInfo("Call RemoveServer to %v", server)
 	cs, ok := csc.servers[server]
 	if !ok {
 		return nil

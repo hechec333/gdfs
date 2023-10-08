@@ -38,7 +38,7 @@ type Master struct {
 func (m *Master) ServeApplyCommand(msg raft.ApplyMsg) (error, error) {
 	m.Lock()
 	defer m.Unlock()
-
+	common.LTrace("<Master> receive apply command from raft")
 	op := msg.Command.(wal.LogOp)
 
 	err := m.dispatch(&op)
@@ -111,7 +111,8 @@ func (m *Master) InstallSnapShot(snap []byte) error {
 // 2.涉及NameSpace的增删
 
 // 所有涉及Master的Voliate-state都必须经过WAL模块
-// 所有涉及Master的Non-Voliate-state都必须在竞选为Leader后重置，并且所有的状态都是由chunkserver提供包括不限于1.chunk的replica信息，2.chunkserver的位置信息
+// 所有涉及Master的Non-Voliate-state都必须在竞选为Leader后重置，并且所有的状态都是由chunkserver提供包括不限于
+// 1.chunk的replica信息，2.chunkserver的位置信息
 const (
 	MetaFileName = "types-master.meta"
 	FilePerm     = 0755
@@ -152,6 +153,13 @@ func (m *Master) init() {
 	}
 	m.cc.ClearVolitateStateAndRebuild()
 	m.csc.ClearAllVoliateStateAndRebuild()
+	if len(m.masterAddrs) == 1 {
+		common.LInfo("init master clusters in standlone")
+	}
+	if len(m.masterAddrs)%2 == 0 {
+		common.LWarn("odd master cluster detecded!")
+	}
+
 	peers := xrpc.NewClientPeers(m.masterAddrs)
 	m.wal = wal.StartWalPeer(m, peers, m.me, ips, common.MaxRaftState)
 }
@@ -160,29 +168,33 @@ func (m *Master) GoBackgroundTask() {
 	snapTicker := time.NewTicker(common.SnapInterval)
 	scanTicker := time.NewTicker(common.LazyCollectInterval)
 	checkTicker := time.NewTicker(common.CheckInterval)
+	common.LInfo("<Master> init background taskgroup [snapshot,scanning,selfcheck]")
 	for {
 		var err error
 		select {
 		case <-snapTicker.C:
+			common.LInfo("<Master> ready to save snapshot")
 			m.wal.NotifySnapShot()
 		case <-scanTicker.C:
+			common.LInfo("<Master> ready to begin garbage collect")
 			err = m.lazyCollector()
 		case <-checkTicker.C:
+			common.LInfo("<Master> ready to begin self check")
 			err = m.serverCheck()
 		case <-m.shutdown:
 			return
 		}
 		if err != nil {
-			log.Printf("[WARN] BACKGROUND Error %v", err)
+			//log.Printf("[WARN] BACKGROUND Error %v", err)
+			common.LWarn("background task error %v", err)
 		}
 	}
 }
 
 func (m *Master) lazyCollector() error {
 	defer func() {
-		err := recover()
-		if err != nil {
-			log.Printf("[WARN] error:%v,debug:%v", err, string(debug.Stack()))
+		if err := recover(); err != nil {
+			common.LWarn("ignored! error %v debug %v", err, string(debug.Stack()))
 		}
 	}()
 	let := wal.NewLogOpLet(m.wal, int64(m.me), 0, "internal")
@@ -222,8 +234,7 @@ func (m *Master) lazyCollector() error {
 func (m *Master) serverCheck() error {
 	// lazy delete
 	defer func() {
-		err := recover()
-		if err != nil {
+		if err := recover(); err != nil {
 			log.Printf("[WARN] error:%v,debug:%v", err, string(debug.Stack()))
 		}
 	}()
@@ -311,6 +322,7 @@ func (m *Master) reReplication(handle types.ChunkHandle) error {
 
 // RPCHeartbeat is called by chunkserver to let the master know that a chunkserver is alive
 func (m *Master) RPCHeartbeat(args types.HeartbeatArg, reply *types.HeartbeatReply) error {
+	common.LTrace("<Master> heartbeat from chunkserver %v", args.Address)
 	_, is := m.wal.RoleState()
 	if !is {
 		reply.Redirect = true
@@ -338,11 +350,11 @@ func (m *Master) RPCHeartbeat(args types.HeartbeatArg, reply *types.HeartbeatRep
 
 			if v.Version == version {
 				//log.Infof("Master receive chunk %v from %v", v.Handle, args.Address)
+				common.LTrace("<Master> commit chunk %v from ck %v", v.ChunkHandle, args.Address)
 				m.cc.RegisterReplicas(v.ChunkHandle, args.Address)
 				m.csc.AddChunk([]types.Addr{args.Address}, v.ChunkHandle)
 			} else {
-				//log.Infof("Master discard %v", v.Handle)
-				log.Printf("Master discard %v", v.ChunkHandle)
+				common.LTrace("<Master> discard chunk %v,inequal version set", v.ChunkHandle)
 			}
 		}
 	}
@@ -355,8 +367,9 @@ func (m *Master) RPCHeartbeat(args types.HeartbeatArg, reply *types.HeartbeatRep
 func (m *Master) RPCGetPrimaryAndSecondaries(args types.GetPrimaryAndSecondariesArg, reply *types.GetPrimaryAndSecondariesReply) error {
 	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
 	defer func() {
-		err := recover()
-		reply.Err = err.(error)
+		if err := recover(); err != nil {
+			reply.Err = err.(error)
+		}
 	}()
 
 	lease, staleServers, err := m.cc.GetLease(let, args.Handle)
@@ -403,8 +416,9 @@ func (m *Master) RPCGetReplicas(args types.GetReplicasArg, reply *types.GetRepli
 // RPCCreateFile is called by client to create a new file
 func (m *Master) RPCCreateFile(args types.CreateFileArg, reply *types.CreateFileReply) (err error) {
 	defer func() {
-		errz := recover()
-		err = errz.(error)
+		if errz := recover(); errz != nil {
+			err = errz.(error)
+		}
 	}()
 	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
 	reply.Err = m.ns.CreateFileImpl(let, args.Path)
@@ -414,8 +428,9 @@ func (m *Master) RPCCreateFile(args types.CreateFileArg, reply *types.CreateFile
 // RPCDelete is called by client to delete a file
 func (m *Master) RPCDeleteFile(args types.DeleteFileArg, reply *types.DeleteFileReply) (err error) {
 	defer func() {
-		errz := recover()
-		err = errz.(error)
+		if errz := recover(); errz != nil {
+			err = errz.(error)
+		}
 	}()
 	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
 	reply.Err = m.ns.DeleteFileImpl(let, args.Path)
@@ -431,8 +446,9 @@ func (m *Master) RPCRenameFile(args types.RenameFileArg, reply *types.RenameFile
 // RPCMkdir is called by client to make a new directory
 func (m *Master) RPCMkdir(args types.MkdirArg, reply *types.MkdirReply) (err error) {
 	defer func() {
-		errz := recover()
-		err = errz.(error)
+		if errz := recover(); errz != nil {
+			err = errz.(error)
+		}
 	}()
 	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
 	reply.Err = m.ns.MkdirImpl(let, args.Path)
@@ -497,8 +513,8 @@ func (m *Master) RPCGetChunkHandle(args types.GetChunkHandleArg, reply *types.Ge
 		if len(errs) == len(addrs) {
 			// WARNING
 			//log.Warning("[ignored] An ignored error in RPCGetChunkHandle when create ", err, " in create chunk ", reply.Handle)
-			log.Printf("Create Chunk error in %v", addrs)
 			reply.Err = errors.Join(errs...)
+			common.LWarn("<Master> Create Chunk to %v errors %v", addrs, reply.Err)
 			return
 		}
 

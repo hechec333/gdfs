@@ -22,9 +22,7 @@ func main() {
 	case "m":
 		m := gdfs.NewMaster(id)
 		c := make(chan os.Signal, 1)
-
 		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
 		<-c
 		m.Stop()
 		log.Println("Recevice exit signal")

@@ -2,6 +2,19 @@ package common
 
 import "time"
 
+type LogLevel uint8
+
+const (
+	LOG_TRACE LogLevel = iota
+	LOG_INFO
+)
+
+var (
+	DefaultLogLevel = LOG_INFO
+	// 是否启用完整日志输出
+	LogCompleteEnable = true
+)
+
 var (
 	MaxClientRetry      = 2
 	MinChunks           = 2

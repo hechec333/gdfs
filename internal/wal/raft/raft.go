@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 	"bytes"
 	"encoding/gob"
+	"gdfs/internal/common"
 	"gdfs/internal/common/rpc"
 	"gdfs/internal/types"
 	"io"
@@ -143,7 +144,8 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&rf.logEntries) != nil ||
 		d.Decode(&rf.LastSnapShotIndex) != nil ||
 		d.Decode(&rf.LastSnapShotTerm) != nil {
-		DPrintf("[R][WARN] read persite failed")
+		//DPrintf("[Raft][WARN] read persite failed")
+		common.LWarn("<Raft> read persite failed")
 	}
 	rf.CommitIndex = rf.LastSnapShotIndex //
 	rf.LastAppliedIndex = rf.CommitIndex
@@ -177,7 +179,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.getRaftState(w)
 	rf.persister.SaveStateAndSnapshot(w.Bytes(), snapshot)
 
-	DPrintf("[R][%v] Server %v Service Call SnapShot On Index %v After Logs %v LastSnapShotIndex %v LastSnapShotTerm %v", GetRole(rf.State), rf.me, index, rf.logEntries, rf.LastSnapShotIndex, rf.LastSnapShotTerm)
+	//DPrintf("[R][%v] Server %v Service Call SnapShot On Index %v After Logs %v LastSnapShotIndex %v LastSnapShotTerm %v", GetRole(rf.State), rf.me, index, rf.logEntries, rf.LastSnapShotIndex, rf.LastSnapShotTerm)
+	common.LInfo("<Raft> [%v] Server %v Service Call SnapShot On Index %v After Logs %v LastSnapShotIndex %v LastSnapShotTerm %v", GetRole(rf.State), rf.me, index, rf.logEntries, rf.LastSnapShotIndex, rf.LastSnapShotTerm)
 }
 
 type InstallSnapShotArg struct {
@@ -194,10 +197,12 @@ type InstallSnapShotReply struct {
 
 func (rf *Raft) InstallSnapShot(args *InstallSnapShotArg, reply *InstallSnapShotReply) {
 	rf.mu.Lock()
-	DPrintf("[R][%v] [INFO] Server %v InstallSnapShot From Leader %v", GetRole(rf.State), rf.me, args.LeaderId)
+	//DPrintf("[R][%v] [INFO] Server %v InstallSnapShot From Leader %v", GetRole(rf.State), rf.me, args.LeaderId)
+	common.LTrace("<Raft>[%v] Server %v InstallSnapShot From Leader %v", GetRole(rf.State), rf.me, args.LeaderId)
 	reply.Term = rf.CurrentTerm
 	if args.Term < rf.CurrentTerm {
-		DPrintf("[R][%v] [WARN] Server %v Reject InstallSnapShot From %v,My Term %v,Caller Term %v", GetRole(rf.State), rf.me, args.LeaderId, rf.CurrentTerm, args.Term)
+		//DPrintf("[R][%v] [WARN] Server %v Reject InstallSnapShot From %v,My Term %v,Caller Term %v", GetRole(rf.State), rf.me, args.LeaderId, rf.CurrentTerm, args.Term)
+		common.LWarn("<Raft>[%v] Server %v Reject InstallSnapShot From %v,My Term %v,Caller Term %v", GetRole(rf.State), rf.me, args.LeaderId, rf.CurrentTerm, args.Term)
 		rf.mu.Unlock()
 		return
 	}
@@ -209,7 +214,8 @@ func (rf *Raft) InstallSnapShot(args *InstallSnapShotArg, reply *InstallSnapShot
 
 	// refuse old snapshot
 	if args.LastIncludeIndex < rf.LastSnapShotIndex {
-		DPrintf("[R][%v] [WARN] Server %v Reject InstallSnapShot From %v,My SnapShotIndex %v ,Caller SnapShotIndex %v", GetRole(rf.State), rf.me, args.LeaderId, rf.LastSnapShotIndex, args.LastIncludeIndex)
+		//DPrintf("[R][%v] [WARN] Server %v Reject InstallSnapShot From %v,My SnapShotIndex %v ,Caller SnapShotIndex %v", GetRole(rf.State), rf.me, args.LeaderId, rf.LastSnapShotIndex, args.LastIncludeIndex)
+		common.LWarn("<Raft> Server %v Reject InstallSnapShot From %v,My SnapShotIndex %v ,Caller SnapShotIndex %v", GetRole(rf.State), rf.me, args.LeaderId, rf.LastSnapShotIndex, args.LastIncludeIndex)
 		rf.mu.Unlock()
 		return
 	}
@@ -232,7 +238,8 @@ func (rf *Raft) InstallSnapShot(args *InstallSnapShotArg, reply *InstallSnapShot
 	//DPrintf("[R][%v] Server %v RefreshTimer", GetRole(rf.State), rf.me)
 	rf.persister.SaveStateAndSnapshot(w.Bytes(), args.SnapShot)
 	//rf.ElecTimeout.RefreshElecTimer()
-	DPrintf("[R][%v] [INFO] Server %v SnapShot Installed,SnapShotIndex %v Logs %v", GetRole(state), rf.me, rf.LastSnapShotIndex, rf.logEntries)
+	//DPrintf("[R][%v] [INFO] Server %v SnapShot Installed,SnapShotIndex %v Logs %v", GetRole(state), rf.me, rf.LastSnapShotIndex, rf.logEntries)
+	common.LTrace("<Raft> [%v] Server %v SnapShot Installed,SnapShotIndex %v Logs %v", GetRole(state), rf.me, rf.LastSnapShotIndex, rf.logEntries)
 	rf.mu.Unlock()
 
 	rf.ApplyCh <- ApplyMsg{
@@ -253,12 +260,12 @@ func (rf *Raft) LeaderSendSnapShot(server int, args *InstallSnapShotArg) {
 		if reply.Term > rf.CurrentTerm {
 			rf.discoverNewTerm(reply.Term)
 		}
-		//DPrintf("[R][%v] Server %v RefreshTimer",GetRole(rf.State),rf.me)
 		//rf.ElecTimeout.RefreshElecTimer()
 		//rf.NextIndex[] = rf.LastSnapShotIndex + 1
-		DPrintf("[R][%v] [INFO] InstallSnapShot To %v", GetRole(rf.State), server)
+		common.LTrace("<Raft>[%v] InstallSnapShot To %v", GetRole(rf.State), server)
 	} else {
-		DPrintf("[R][Leader] [FAIL] SendSnapShot to Server %v,Network Fail", server)
+		//DPrintf("[R][Leader] [FAIL] SendSnapShot to Server %v,Network Fail", server)
+		common.LWarn("<Raft> %v SendSnapShot to Server %v,Network Fail", GetRole(rf.State), server)
 	}
 }
 
@@ -291,7 +298,8 @@ func (rf *Raft) PreVote(args *PreVoteArgs, reply *PreVoteReply) {
 	lastLog := rf.getLastLog()
 	rf.mu.Unlock()
 
-	DPrintf("[R][%v] [INFO] Server %v Get PreVote from %v args:%v", GetRole(state), rf.me, args.CandidateId, *args)
+	//DPrintf("[R][%v] [INFO] Server %v Get PreVote from %v args:%v", GetRole(state), rf.me, args.CandidateId, *args)
+	common.LTrace("<Raft>%v Server %v Get PreVote from %v args:%v", GetRole(state), rf.me, args.CandidateId, *args)
 	if args.Term > term {
 		term = args.Term
 		votedFor = -1
@@ -349,8 +357,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.VoteFor == -1 && upTodateFlag {
 		rf.VoteFor = args.CandidateId
 		reply.Success = true
-
-		//DPrintf("[R][%v] Server %v RefreshTimer", GetRole(rf.State), rf.me)
 		rf.persist()
 		rf.ElecTimeout.RefreshElecTimer()
 	} else {
@@ -368,8 +374,8 @@ func (rf *Raft) checkLogSafety(args *RequestVoteArgs) bool {
 	// 	return true
 	// }
 	lastlog := rf.getLastLog()
-	//rf.getLastLogIndex()
-	DPrintf("[R][%v][INFO]<LOG-CHECK> Server %v logs:%v, requestVote Args:%v", GetRole(rf.State), rf.me, rf.logEntries, *args)
+	//DPrintf("[R][%v][INFO]<LOG-CHECK> Server %v logs:%v, requestVote Args:%v", GetRole(rf.State), rf.me, rf.logEntries, *args)
+	common.LTrace("<Raft> Server %v logs:%v, requestVote Args:%v", GetRole(rf.State), rf.me, rf.logEntries, *args)
 	if args.LastLogTerm > lastlog.Term {
 		return true
 	} else if args.LastLogTerm == lastlog.Term {
@@ -382,7 +388,8 @@ func (rf *Raft) checkLogSafety(args *RequestVoteArgs) bool {
 // rpc请求中发现了更高的term号
 // 更新到下一轮投票中
 func (rf *Raft) discoverNewTerm(Term int) {
-	DPrintf("[R][%v][INFO] Server %v Convert to Follower,Origin Term %v,New Term %v", GetRole(rf.State), rf.me, rf.CurrentTerm, Term)
+	//DPrintf("[R][%v][INFO] Server %v Convert to Follower,Origin Term %v,New Term %v", GetRole(rf.State), rf.me, rf.CurrentTerm, Term)
+	common.LTrace("<Raft> Server %v Convert to Follower,Origin Term %v,New Term %v", GetRole(rf.State), rf.me, rf.CurrentTerm, Term)
 	rf.CurrentTerm = Term
 	rf.State = Follower
 	rf.VoteFor = -1
@@ -426,6 +433,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    term,
 	})
 	//DPrintf("[R][Leader][%v] [INFO] Receive Command,Index %v Command %v", rf.me, index, command)
+	common.LTrace("<Raft>[Leader][%v] Receive Command,Index %v Command %v", rf.me, index, command)
 	rf.persist()
 	//也可以等待下一轮心跳在发送
 	rf.doAE(false)
@@ -716,12 +724,12 @@ func (rf *Raft) LeaderCommit() {
 func (rf *Raft) doAE(check bool) {
 	for server := range rf.peers {
 		if server == rf.me {
-			//DPrintf("[R][%v] Server %v RefreshTimer", GetRole(rf.State), rf.me)
 			rf.ElecTimeout.RefreshElecTimer()
 			continue
 		}
 		if check {
-			DPrintf("[R][%v] Server %v AE-CHECK", GetRole(rf.State), rf.me)
+			//DPrintf("[R][%v] Server %v AE-CHECK", GetRole(rf.State), rf.me)
+			common.LTrace("<Raft>[%v] Server %v AE-CHECK", GetRole(rf.State), rf.me)
 		}
 		// 如果不是心跳包必须
 		if check || rf.getLastLogIndex() >= rf.NextIndex[server] {
@@ -822,7 +830,8 @@ func (rf *Raft) leaderElection() {
 	// defer rf.mu.Unlock()
 	rf.CurrentTerm++
 	rf.VoteFor = rf.me
-	DPrintf("[R][%v][INFO] Leader-Elec:[%v],Term:[%v]", GetRole(rf.State), rf.me, rf.CurrentTerm)
+	//DPrintf("[R][%v][INFO] Leader-Elec:[%v],Term:[%v]", GetRole(rf.State), rf.me, rf.CurrentTerm)
+	common.LInfo("<Raft>[%v]-[%v] election begin!,term %v", GetRole(rf.State), rf.me, rf.CurrentTerm)
 	rf.persist()
 	rf.State = Candiate
 	args := rf.getRequestVoteArg()
@@ -843,7 +852,6 @@ func (rf *Raft) Campagin() {
 
 	for server := range rf.peers {
 		if server == rf.me {
-			//DPrintf("[R][%v] Server %v RefreshTimer", GetRole(rf.State), rf.me)
 			//rf.ElecTimeout.RefreshElecTimer()
 			continue
 		}
@@ -858,17 +866,17 @@ func (rf *Raft) CallPreVote(server int, counter *int, mux *sync.Mutex, args *Pre
 	if rf.sendPreVote(server, args, &resp) {
 		// rf.mu.Lock()
 		// defer rf.mu.Unlock()
-		DPrintf("[R][Campaign][DEBUG] Server %v Receive PreVoteReply %v", rf.me, resp)
+		//DPrintf("[R][Campaign][DEBUG] Server %v Receive PreVoteReply %v", rf.me, resp)
+		common.LTrace("<Raft>[Campaign] Server %v Receive PreVoteReply %v", rf.me, resp)
 		mux.Lock()
 		defer mux.Unlock()
 		if resp.Success {
 			*counter++
-			DPrintf("[R][Campaign][INFO] Server: %v Gain Vote form : %v > [%v/%v]", rf.me, server, *counter, len(rf.peers))
+			//DPrintf("[R][Campaign][INFO] Server: %v Gain Vote form : %v > [%v/%v]", rf.me, server, *counter, len(rf.peers))
+			common.LTrace("<Raft>[Campaign]Server: %v Gain Vote form : %v > [%v/%v]", rf.me, server, *counter, len(rf.peers))
 		}
 		if *counter*2 > len(rf.peers) {
-			////DPrintf("[R][%v] Server %v RefreshTimer", GetRole(rf.State), rf.me)
 			rf.mu.Lock()
-			//rf.ElecTimeout.RefreshElecTimer()
 			if rf.State != Leader {
 				DPrintf("[R][Campaign][INFO] Server %v Ready to Election", rf.me)
 				rf.leaderElection()
@@ -877,7 +885,7 @@ func (rf *Raft) CallPreVote(server int, counter *int, mux *sync.Mutex, args *Pre
 			rf.mu.Unlock()
 		}
 	} else {
-		DPrintf("[R][Campaign][FAIL] Call Server %v For PreVote,NetWork Fail", server)
+		common.LWarn("<Raft>[Campaign][FAIL] Call Server %v For PreVote,NetWork Fail", server)
 	}
 }
 
@@ -886,15 +894,15 @@ func (rf *Raft) CallRequestVote(server int, counter *int, args *RequestVoteArgs)
 	if rf.sendRequestVote(server, args, &argv) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		DPrintf("[R][%v][DEBUG] Server %v,Recevie RequestVoteReply: %v", GetRole(rf.State), rf.me, argv)
+		common.LWarn("<Raft>[%v] Server %v,Recevie RequestVoteReply: %v", GetRole(rf.State), rf.me, argv)
 		if argv.Term > rf.CurrentTerm {
-			DPrintf("[R][%v][INFO] Server: %v dicover higher Term: %v", GetRole(rf.State), rf.me, argv.Term)
+			common.LInfo("[R][%v] Server: %v dicover higher Term: %v", GetRole(rf.State), rf.me, argv.Term)
 			rf.discoverNewTerm(argv.Term)
 			return
 		}
 		if argv.Success {
 			*counter++
-			DPrintf("[R][%v][INFO] Server: %v Gain Vote form : %v > [%v/%v]", GetRole(rf.State), rf.me, server, *counter, len(rf.peers))
+			common.LInfo("<Raft>[%v] Server: %v Gain Vote form : %v > [%v/%v]", GetRole(rf.State), rf.me, server, *counter, len(rf.peers))
 		}
 		if rf.State == Candiate && *counter*2 > len(rf.peers) {
 			rf.State = Leader
@@ -904,20 +912,21 @@ func (rf *Raft) CallRequestVote(server int, counter *int, args *RequestVoteArgs)
 	} else {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		DPrintf("[R][%v][FAIL] Server: %v,CallRequestVote Network FAIL", GetRole(rf.State), rf.me)
+		common.LWarn("<Raft>[%v] Server: %v,CallRequestVote Network FAIL", GetRole(rf.State), rf.me)
 	}
 }
 
 // 调整自己成Leader
 func (rf *Raft) becomeLeader() {
-	DPrintf("[R][%v][INFO] become Leader,id:%v,Term:%v,logs:%v", GetRole(rf.State), rf.me, rf.CurrentTerm, rf.logEntries)
+	common.LTrace("<Raft>[%v] become Leader,id:%v,Term:%v,logs:%v", GetRole(rf.State), rf.me, rf.CurrentTerm, rf.logEntries)
 	rf.State = Leader
 	for i := 0; i < len(rf.peers); i++ {
 		rf.NextIndex[i] = rf.getLastLogIndex() + 1
 		rf.MatchIndex[i] = rf.CommitIndex
 	}
 	rf.ElecFailTime = 0
-	DPrintf("[R][%v][DEBUG] NextIndex: %v", GetRole(rf.State), rf.NextIndex)
+	//DPrintf("[R][%v][DEBUG] NextIndex: %v", GetRole(rf.State), rf.NextIndex)
+	common.LTrace("<Raft>[%v] become Leader,id:%v,Term:%v,logs:%v", GetRole(rf.State), rf.me, rf.CurrentTerm, rf.logEntries)
 }
 
 // 通知提交日志
@@ -932,7 +941,8 @@ func (rf *Raft) Applier() {
 	for !rf.killed() {
 		if rf.CommitIndex > rf.LastAppliedIndex && rf.getLastLogIndex() > rf.LastAppliedIndex {
 			rf.LastAppliedIndex++
-			DPrintf("[R][%v][INFO] Server %v Apply,CommitIndex:%v,ApplyIndex:%v", GetRole(rf.State), rf.me, rf.CommitIndex, rf.LastAppliedIndex)
+			common.LInfo("<Raft>[%v][INFO] Server %v Apply,CommitIndex:%v,ApplyIndex:%v", GetRole(rf.State), rf.me, rf.CommitIndex, rf.LastAppliedIndex)
+			//DPrintf("[R][%v][INFO] Server %v Apply,CommitIndex:%v,ApplyIndex:%v", GetRole(rf.State), rf.me, rf.CommitIndex, rf.LastAppliedIndex)
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.GlobalFetchLog(rf.LastAppliedIndex).Command,
@@ -955,30 +965,18 @@ func (rf *Raft) Applier() {
 func (rf *Raft) ticker() {
 	rf.InitRandomSleep(1)
 	for !rf.killed() {
-		// rf.mu.Lock()
-		// defer rf.mu.Unlock()
 		// time.Sleep().
 		time.Sleep(rf.HeartBeatDuration)
-		//DPrintf("[R]Ticker:[%v] === Raft-State:[%v]", rf.me, GetRole(rf.State))
 		rf.mu.Lock()
-		//DPrintf("[R][%v][%v] Ticker ====", GetRole(rf.State), rf.me)
 		switch rf.State {
 		case Leader:
 			rf.doAE(true)
 		default:
 			if rf.ElecTimeout.Check() {
-				// if rf.ElecFailTime > MaxElecFailTimes {
-				// 	//rf.InitRandomSleep(4)
-				// 	rf.ElecFailTime = 0
-				// } else {
-				// 	rf.leaderElection()
-				// 	rf.ElecFailTime++
-				// }
-				DPrintf("[R][%v][%v] Election TimeOut,Ready to Campaign", GetRole(rf.State), rf.me)
+				common.LInfo("<Raft>[%v][%v] election timeout!!,ready to campaign", GetRole(rf.State), rf.me)
 				rf.Campagin()
 			}
 		}
-
 		rf.mu.Unlock()
 	}
 }
@@ -994,7 +992,8 @@ type ElecDealineTimer struct {
 func (rf *Raft) InitRandomSleep(plus int) {
 	n := rand.Intn(plus * int(rf.HeartBeatDuration) / int(time.Millisecond))
 	n += 20
-	DPrintf("[R][INFO] Init Sleep %v ms", n)
+	common.LInfo("<Raft> init random sleep time", n)
+	//DPrintf("[R][INFO] Init Sleep %v ms", n)
 	time.Sleep(time.Duration(n * int(time.Millisecond)))
 }
 
@@ -1012,7 +1011,7 @@ func (ed *ElecDealineTimer) RefreshElecTimer() {
 	if dur <= 4*HeartBeat*time.Millisecond {
 		ed.Deadline = ed.Deadline.Add(ed.TimeOuts)
 	}
-	//DPrintf("[R]New Expire Time: %v", ed.Deadline)
+	common.LTrace("<Raft> new exipre time in %v", ed.Deadline)
 }
 
 // 判断选举时钟是否过期
@@ -1050,12 +1049,12 @@ func Make(peers []*rpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	if rf.VoteFor != 0 && rf.VoteFor != -1 {
-		DPrintf("[R][Recover] Server %v,Term %v Log:%v", rf.me, rf.CurrentTerm, rf.logEntries)
+		//DPrintf("[R][Recover] Server %v,Term %v Log:%v", rf.me, rf.CurrentTerm, rf.logEntries)
+		common.LInfo("<Raft> recover server %v, term %v log %v", rf.me, rf.CurrentTerm, rf.logEntries)
 	}
-	//rf.NextIndex[rf.me] = len(rf.logEntries) + 1 //记录当前的lastLogindex + 1
-	// n := rand.Intn(2 * int(rf.HeartBeatDuration) / int(time.Millisecond))
 	rf.ElecTimeout.ResetTimout(rf.HeartBeatDuration + rf.HeartBeatDuration/2)
-	DPrintf("[R]Make peer: %v, elec timeout: %v", rf.me, rf.ElecTimeout.TimeOuts)
+	//DPrintf("[R]Make peer: %v, elec timeout: %v", rf.me, rf.ElecTimeout.TimeOuts)
+	common.LInfo("<Raft> make peer %v, init election timeout expire %v", rf.me, rf.ElecTimeout.Deadline)
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.Applier()
