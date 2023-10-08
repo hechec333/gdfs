@@ -195,7 +195,7 @@ type InstallSnapShotReply struct {
 	Term int
 }
 
-func (rf *Raft) InstallSnapShot(args *InstallSnapShotArg, reply *InstallSnapShotReply) {
+func (rf *Raft) InstallSnapShot(args *InstallSnapShotArg, reply *InstallSnapShotReply) (err error) {
 	rf.mu.Lock()
 	//DPrintf("[R][%v] [INFO] Server %v InstallSnapShot From Leader %v", GetRole(rf.State), rf.me, args.LeaderId)
 	common.LTrace("<Raft>[%v] Server %v InstallSnapShot From Leader %v", GetRole(rf.State), rf.me, args.LeaderId)
@@ -248,7 +248,7 @@ func (rf *Raft) InstallSnapShot(args *InstallSnapShotArg, reply *InstallSnapShot
 		SnapshotTerm:  args.LastIncludeTerm,
 		SnapshotIndex: args.LastIncludeIndex, //全局索引
 	}
-
+	return
 }
 
 func (rf *Raft) LeaderSendSnapShot(server int, args *InstallSnapShotArg) {
@@ -287,10 +287,15 @@ type PreVoteReply struct {
 }
 
 func (rf *Raft) sendPreVote(server int, args *PreVoteArgs, reply *PreVoteReply) bool {
-	return rf.peers[server].Call("Raft.PreVote", args, reply) == nil
+	err := rf.peers[server].Call("Raft.PreVote", args, reply)
+
+	if err != nil {
+		common.LWarn("sendPreVote error %v", err)
+	}
+	return err == nil
 }
 
-func (rf *Raft) PreVote(args *PreVoteArgs, reply *PreVoteReply) {
+func (rf *Raft) PreVote(args *PreVoteArgs, reply *PreVoteReply) (err error) {
 	rf.mu.Lock()
 	term := rf.CurrentTerm
 	state := rf.State
@@ -315,6 +320,7 @@ func (rf *Raft) PreVote(args *PreVoteArgs, reply *PreVoteReply) {
 	if votedFor == -1 && up {
 		reply.Success = true
 	}
+	return
 }
 
 // example RequestVote RPC arguments structure.
@@ -343,7 +349,7 @@ type RequestVoteReply struct {
 // 1.正在选举中，收到其他投票请求
 // 2.已经投票，但是又收到其他高term的投票
 // 3.leader有可能收到投票请求
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) (err error) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -363,6 +369,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Success = false
 	}
 	reply.Term = rf.CurrentTerm
+	return
 }
 
 // 判断是否投票
@@ -389,7 +396,7 @@ func (rf *Raft) checkLogSafety(args *RequestVoteArgs) bool {
 // 更新到下一轮投票中
 func (rf *Raft) discoverNewTerm(Term int) {
 	//DPrintf("[R][%v][INFO] Server %v Convert to Follower,Origin Term %v,New Term %v", GetRole(rf.State), rf.me, rf.CurrentTerm, Term)
-	common.LTrace("<Raft> Server %v Convert to Follower,Origin Term %v,New Term %v", GetRole(rf.State), rf.me, rf.CurrentTerm, Term)
+	common.LInfo("<Raft> Server %v Convert to Follower,Origin Term %v,New Term %v", GetRole(rf.State), rf.me, rf.CurrentTerm, Term)
 	rf.CurrentTerm = Term
 	rf.State = Follower
 	rf.VoteFor = -1
@@ -397,7 +404,9 @@ func (rf *Raft) discoverNewTerm(Term int) {
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-
+	if ok != nil {
+		common.LWarn("sendRequestVote error %v", ok)
+	}
 	return ok == nil
 }
 func (rf *Raft) Role() int {
@@ -485,22 +494,26 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
-
+	if ok != nil {
+		common.LWarn("sendAE error %v", ok)
+	}
 	return ok == nil
 }
 
 // 需要修改以适应2D snapshot
 // 不可能出现Follower已持久的快照会比Leader更新
-func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) (err error) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	reply.Success = false
 	reply.Term = rf.CurrentTerm
-	DPrintf("[R][%v][INFO] Server %v,Receive AE %v", GetRole(rf.State), rf.me, GetAEReport(args))
+	//DPrintf("[R][%v][INFO] Server %v,Receive AE %v", GetRole(rf.State), rf.me, GetAEReport(args))
 	//DPrintf("[R]Report Self Log:%v", rf.logEntries)
+	common.LTrace("<Raft>[%v] Server %v,Receive AE %v", GetRole(rf.State), rf.me, GetAEReport(args))
 	if args.Term < rf.CurrentTerm {
-		DPrintf("[R][%v][WARN] Server %v,Reject AE From %v,My Term %v,AE Term:%v", GetRole(rf.State), rf.me, args.LeaderId, rf.CurrentTerm, args.Term)
+		//DPrintf("[R][%v][WARN] Server %v,Reject AE From %v,My Term %v,AE Term:%v", GetRole(rf.State), rf.me, args.LeaderId, rf.CurrentTerm, args.Term)
+		common.LWarn("<Raft>[%v] Server %v,Reject AE From %v,My Term %v,AE Term:%v", GetRole(rf.State), rf.me, args.LeaderId, rf.CurrentTerm, args.Term)
 		return
 	}
 
@@ -533,8 +546,8 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 	}
 	// 快照一致并且日志冲突
 	if rf.getLastLogIndex() >= args.PrevLogIndex && rf.GlobalFetchLog(args.PrevLogIndex).Term != args.PrevLogTerm {
-		// DPrintf("[R][Follower][%v] ")
-		DPrintf("[R][Follower][WARN] Log didn't match,myLog:%v,SnapShotIndex %v,SnapShotTerm %v", rf.logEntries, rf.LastSnapShotIndex, rf.LastSnapShotTerm)
+		//DPrintf("[R][Follower][WARN] Log didn't match,myLog:%v,SnapShotIndex %v,SnapShotTerm %v", rf.logEntries, rf.LastSnapShotIndex, rf.LastSnapShotTerm)
+		common.LWarn("<Raft>[Follower] Log didn't match,myLog:%v,SnapShotIndex %v,SnapShotTerm %v", rf.logEntries, rf.LastSnapShotIndex, rf.LastSnapShotTerm)
 		reply.Conflict = true
 		hterm := rf.GlobalFetchLog(args.PrevLogIndex).Term
 
@@ -567,7 +580,9 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		rf.Apply()
 	}
 	DPrintf("[R][%v][INFO] Report Self Log:%v", GetRole(rf.State), rf.logEntries)
+	common.LTrace("<Raft>[%v] Report Self Log:%v", GetRole(rf.State), rf.logEntries)
 	reply.Success = true
+	return
 }
 
 func max(a, b int) int {
@@ -592,7 +607,8 @@ func (rf *Raft) LeaderSendAE(peer int, args *AppendEntriesArgs) {
 
 	if !ok {
 		//DPrintf("[R][%v] [INFO] Server:%v SendAE to %v FAIL, Logs:%v", GetRole(rf.State), rf.me, peer, rf.logEntries)
-		DPrintf("[R][Leader][INFO] Server:%v SendAE to %v FAIL", rf.me, peer)
+		//DPrintf("[R][Leader][INFO] Server:%v SendAE to %v FAIL", rf.me, peer)
+		common.LWarn("<Raft>[Leader] Server:%v SendAE to %v FAIL", rf.me, peer)
 		return //遭遇网络故障
 	}
 	rf.mu.Lock()
@@ -609,9 +625,11 @@ func (rf *Raft) LeaderSendAE(peer int, args *AppendEntriesArgs) {
 			next := match + 1
 			rf.NextIndex[peer] = max(rf.NextIndex[peer], next)
 			rf.MatchIndex[peer] = max(rf.MatchIndex[peer], match)
-			DPrintf("[R][Leader][INFO] Server:%v,NextIndex:%v,MatchIndex:%v", peer, rf.NextIndex[peer], rf.MatchIndex[peer])
+			common.LTrace("<Raft>[Leader][INFO] Server:%v,NextIndex:%v,MatchIndex:%v", peer, rf.NextIndex[peer], rf.MatchIndex[peer])
+			//DPrintf("[R][Leader][INFO] Server:%v,NextIndex:%v,MatchIndex:%v", peer, rf.NextIndex[peer], rf.MatchIndex[peer])
 		} else if resp.Conflict {
-			DPrintf("[R][%v][INFO]<AE> Server %v -> Server %v RollBack [%v]", GetRole(rf.State), rf.me, peer, resp)
+			common.LTrace("<Raft>[%v]<AE> Server %v -> Server %v RollBack [%v]", GetRole(rf.State), rf.me, peer, resp)
+			//DPrintf("[R][%v][INFO]<AE> Server %v -> Server %v RollBack [%v]", GetRole(rf.State), rf.me, peer, resp)
 			if resp.HTerm == -1 {
 				// follower 日志落后，直接调整到日志长度位置
 				// 判断是否缺少日志
@@ -625,7 +643,8 @@ func (rf *Raft) LeaderSendAE(peer int, args *AppendEntriesArgs) {
 						SnapShot:         rf.persister.ReadSnapshot(),
 					}
 					rf.NextIndex[peer] = rf.LastSnapShotIndex + 1
-					DPrintf("[R][%v][WARN] InstallSnapShot -> Server %v SnapShotIndex %v SnapShotTerm %v", GetRole(rf.State), rf.me, rf.LastSnapShotIndex, rf.LastSnapShotTerm)
+					common.LTrace("<Raft>[%v][WARN] InstallSnapShot -> Server %v SnapShotIndex %v SnapShotTerm %v", GetRole(rf.State), rf.me, rf.LastSnapShotIndex, rf.LastSnapShotTerm)
+					//DPrintf("[R][%v][WARN] InstallSnapShot -> Server %v SnapShotIndex %v SnapShotTerm %v", GetRole(rf.State), rf.me, rf.LastSnapShotIndex, rf.LastSnapShotTerm)
 					go rf.LeaderSendSnapShot(peer, args)
 				} else {
 					// 更新全局索引
@@ -633,7 +652,8 @@ func (rf *Raft) LeaderSendAE(peer int, args *AppendEntriesArgs) {
 				}
 			} else {
 				//查找 follower冲突处的日志任期的最后一个日志
-				DPrintf("[R][%v][WARN] Server %v Miss Log", GetRole(rf.State), peer)
+				//DPrintf("[R][%v][WARN] Server %v Miss Log", GetRole(rf.State), peer)
+				common.LTrace("<Raft>[%v][WARN] Server %v Miss Log", GetRole(rf.State), peer)
 				index := rf.FindLastMatchIndex(resp.HTerm)
 				if index > 0 {
 					//如果找到，准备添加日志
@@ -896,7 +916,7 @@ func (rf *Raft) CallRequestVote(server int, counter *int, args *RequestVoteArgs)
 		defer rf.mu.Unlock()
 		common.LWarn("<Raft>[%v] Server %v,Recevie RequestVoteReply: %v", GetRole(rf.State), rf.me, argv)
 		if argv.Term > rf.CurrentTerm {
-			common.LInfo("[R][%v] Server: %v dicover higher Term: %v", GetRole(rf.State), rf.me, argv.Term)
+			//common.LInfo("[R][%v] Server: %v dicover higher Term: %v", GetRole(rf.State), rf.me, argv.Term)
 			rf.discoverNewTerm(argv.Term)
 			return
 		}
@@ -918,7 +938,7 @@ func (rf *Raft) CallRequestVote(server int, counter *int, args *RequestVoteArgs)
 
 // 调整自己成Leader
 func (rf *Raft) becomeLeader() {
-	common.LTrace("<Raft>[%v] become Leader,id:%v,Term:%v,logs:%v", GetRole(rf.State), rf.me, rf.CurrentTerm, rf.logEntries)
+	common.LInfo("<Raft>[%v] become Leader,id:%v,Term:%v,logs:%v", GetRole(rf.State), rf.me, rf.CurrentTerm, rf.logEntries)
 	rf.State = Leader
 	for i := 0; i < len(rf.peers); i++ {
 		rf.NextIndex[i] = rf.getLastLogIndex() + 1
@@ -926,7 +946,7 @@ func (rf *Raft) becomeLeader() {
 	}
 	rf.ElecFailTime = 0
 	//DPrintf("[R][%v][DEBUG] NextIndex: %v", GetRole(rf.State), rf.NextIndex)
-	common.LTrace("<Raft>[%v] become Leader,id:%v,Term:%v,logs:%v", GetRole(rf.State), rf.me, rf.CurrentTerm, rf.logEntries)
+	common.LInfo("<Raft>[%v] become Leader,id:%v,Term:%v,logs:%v", GetRole(rf.State), rf.me, rf.CurrentTerm, rf.logEntries)
 }
 
 // 通知提交日志

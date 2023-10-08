@@ -452,7 +452,7 @@ func (cc *ChunkControlor) GetLease(do *wal.LogOpLet, handle types.ChunkHandle) (
 			wg.Add(1)
 			go func(peer types.Addr) {
 				var reply types.CheckReplicaVersionReply
-				err := rpc.Call(v, "ChunkServer.CheckReplicaVersion", &arg, &reply)
+				err := rpc.Call(peer, "ChunkServer.CheckReplicaVersion", &arg, &reply)
 				mu.Lock()
 				defer mu.Unlock()
 				if err == nil && !reply.IsStale {

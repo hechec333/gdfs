@@ -5,6 +5,8 @@ import (
 	crand "crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
+	"gdfs/config"
 	"gdfs/internal/types"
 	"hash/crc32"
 	"log"
@@ -113,4 +115,32 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 		log.Printf(format, a...)
 	}
 	return
+}
+
+func JoinErrors(errs ...error) error {
+	str := make([]string, len(errs))
+
+	for i, v := range errs {
+		str[i] = v.Error()
+	}
+
+	return fmt.Errorf("%v", strings.Join(str, ";"))
+}
+
+func MusOpenLogFile(cc *config.Node) {
+	var (
+		f   *os.File
+		err error
+	)
+	if IsExist(cc.Debug) {
+		f, err = os.Open(cc.Debug)
+
+	} else {
+		f, err = os.Create(cc.Debug)
+	}
+	if err != nil {
+		panic(err)
+	}
+
+	SetLogger(f)
 }

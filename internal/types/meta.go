@@ -15,8 +15,9 @@ type ChunkServerServeConfig struct {
 }
 
 type MetaServerServeConfig struct {
-	Me      int
-	Servers []Addr
+	Me       int
+	Servers  []Addr
+	Protocol []Addr
 }
 
 type PathInfo struct {

@@ -7,18 +7,24 @@
                 <uuid>1</uuid>
                 <address>127.0.0.1</address>
                 <port>4679</port>
+                <debug>debug/m1.log</debug>
+                <quromn>5679</quromn>
             </node>
             <node>
                 <name>m2</name>
                 <uuid>2</uuid>
                 <address>127.0.0.1</address>
                 <port>4680</port>
+                <debug>debug/m2.log</debug>
+                <quromn>5680</quromn>
             </node>
             <node>
                 <name>m3</name>
                 <uuid>3</uuid>
                 <address>127.0.0.1</address>
                 <port>4681</port>
+                <debug>debug/m3.log</debug>
+                <quromn>5681</quromn>
             </node>
         </master>
         <chunkserver>
@@ -27,18 +33,21 @@
                 <uuid>1</uuid>
                 <address>127.0.0.1</address>
                 <port>3679</port>
+                <debug>debug/ck1.log</debug>
             </node>
             <node>
                 <name>ck2</name>
                 <uuid>2</uuid>
                 <address>127.0.0.1</address>
                 <port>3680</port>
+                <debug>debug/ck2.log</debug>
             </node>
             <node>
                 <name>ck3</name>
                 <uuid>3</uuid>
                 <address>127.0.0.1</address>
                 <port>3681</port>
+                <debug>debug/ck3.log</debug>
             </node>
         </chunkserver>
     </clusters>

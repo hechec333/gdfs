@@ -312,7 +312,7 @@ func (nsc *NameSpaceControlor) FetchAllDeletedFiles(do *wal.LogOpLet) ([]types.F
 		}
 	}
 	if len(errs) != 0 {
-		return files, errors.Join(errs...)
+		return files, common.JoinErrors(errs...)
 	}
 	return files, nil
 }

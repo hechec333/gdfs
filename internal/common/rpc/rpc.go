@@ -19,6 +19,10 @@ type ClientEnd struct {
 	cl     *rpc.Client
 }
 
+var (
+	ErrTimeOut = errors.New("rpc i/o timeout")
+)
+
 var mu sync.RWMutex
 var rpcPool []*ClientEnd
 
@@ -65,6 +69,7 @@ func (ce *ClientEnd) Call(service string, args any, reply any, opts ...CallOptio
 	if ce.cl == nil {
 		err := ce.dial() //是否需要超时管理,建立连接
 		if err != nil {
+			common.LFail("rpc dial error %v", err)
 			return err
 		}
 	}
@@ -95,7 +100,7 @@ func (ce *ClientEnd) callWithConfig(cf *RpcClientConfig, service string, args an
 			log.Println("rpc i/o timeout")
 			ce.cl.Close()
 			ce.cl = nil
-			return errors.New("rpc i/o timeout")
+			return ErrTimeOut
 		case err := <-errCh:
 			if err != nil {
 				log.Println("rpc error", err)
@@ -129,14 +134,8 @@ func isClientEndExist(server types.Addr) bool {
 }
 
 func Call(server types.Addr, service string, args any, reply any, opts ...CallOption) error {
-	var cli *ClientEnd
-	if !isClientEndExist(server) {
-		mu.Lock()
-		defer mu.Unlock()
-		cli = NewClientEnd(string(server))
-		rpcPool = append(rpcPool, cli)
-	}
 
+	cli := findClientEnd(server)
 	return cli.Call(service, args, reply, opts...)
 }
 
@@ -154,7 +153,9 @@ func NewRpcAndServe(srv *rpc.Server, l net.Listener, stop chan struct{}, opts ..
 		case <-stop:
 			return
 		default:
-			l.(*net.TCPListener).SetDeadline(time.Now().Add(cf.AcceptTimeout))
+			if cf.AcceptTimeout != 0 {
+				l.(*net.TCPListener).SetDeadline(time.Now().Add(cf.AcceptTimeout))
+			}
 			conn, err := l.Accept()
 			if err != nil {
 				log.Printf("rpc accept error %v", err)
@@ -180,4 +181,22 @@ func NewClientPeers(addrs []types.Addr) []*ClientEnd {
 		}
 	}
 	return ce
+}
+
+func findClientEnd(server types.Addr) (cli *ClientEnd) {
+	if !isClientEndExist(server) {
+		mu.Lock()
+		defer mu.Unlock()
+		cli = NewClientEnd(string(server))
+		rpcPool = append(rpcPool, cli)
+		return cli
+	}
+	mu.RLock()
+	defer mu.RUnlock()
+	for i, v := range rpcPool {
+		if v.EndPoint() == string(server) {
+			return rpcPool[i]
+		}
+	}
+	return nil
 }

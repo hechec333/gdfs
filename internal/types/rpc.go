@@ -193,3 +193,12 @@ type MasterCheckReply struct {
 	Master bool
 	Term   int
 }
+
+type ReportCurrentMasterAddrArg struct {
+}
+
+type ReportCurrentMasterAddrReply struct {
+	Master    Addr
+	SpinIdle  time.Duration
+	Spincount int
+}

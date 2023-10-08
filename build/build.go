@@ -57,7 +57,7 @@ func GenRunScript() {
 	if common.IsExist(path) {
 		os.Remove(path)
 	}
-
+	config.SetPath("..")
 	cfg := config.GetClusterConfig()
 
 	var buf bytes.Buffer

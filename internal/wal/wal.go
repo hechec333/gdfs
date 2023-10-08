@@ -298,6 +298,10 @@ func (wal *WriteAheadLog) stoped() bool {
 	z := atomic.LoadInt32(&wal.dead)
 	return z == 1
 }
+
+func (wal *WriteAheadLog) Getrf() *raft.Raft {
+	return wal.rf
+}
 func StartWalPeer(cmd ICommandLet, servers []*rpc.ClientEnd, me int, persiter types.IPersiter, maxraftstate int) *WriteAheadLog {
 	wal := new(WriteAheadLog)
 	wal.me = me

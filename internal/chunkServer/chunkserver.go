@@ -23,7 +23,10 @@ type ChunkServer struct {
 	address  types.Addr   // chunkserver address
 	masters  []types.Addr // master address
 	who      int
-	rootDir  string // path to data storage
+	spin     int // total spin times
+	lastspin time.Time
+	spinidle time.Duration // total time cost in spin to check master
+	rootDir  string        // path to data storage
 	l        net.Listener
 	shutdown chan struct{}
 
@@ -55,7 +58,7 @@ type chunkInfo struct {
 
 const (
 	MetaFileName = "gdfs-server.meta"
-	FilePerm     = 0755
+	FilePerm     = 0644
 )
 
 var ErrNotFoundMaster = errors.New("not found master")
@@ -93,6 +96,8 @@ func MustNewAndServe(config *types.ChunkServerServeConfig) *ChunkServer {
 		seq:      0,
 		clientid: cid,
 	}
+
+	common.LInfo("starting chunkserver with masteraddrs %v who %v", cs.masters, cs.who)
 	// 2
 	server := rpc.NewServer()
 	server.Register(cs)
@@ -124,6 +129,9 @@ func MustNewAndServe(config *types.ChunkServerServeConfig) *ChunkServer {
 func (cs *ChunkServer) Stop() {
 	cs.shutdown <- struct{}{}
 }
+func (cs *ChunkServer) metaName() string {
+	return "ck-" + string(cs.address) + ".meta"
+}
 func (cs *ChunkServer) GoBackGroundTask() {
 	storeTicker := time.NewTicker(12 * time.Hour)
 	garbagerTicker := time.NewTicker(8 * time.Hour)
@@ -146,7 +154,7 @@ func (cs *ChunkServer) GoBackGroundTask() {
 func (cs *ChunkServer) GoHeartbeat() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	redirect := false
-	common.LTrace("heart beat to master,current master addr", cs.masters[cs.who])
+	common.LInfo("heart beat to master,current master addr %v", cs.masters[cs.who])
 	var err error
 	for {
 		select {
@@ -155,14 +163,22 @@ func (cs *ChunkServer) GoHeartbeat() {
 		case <-ticker.C:
 			if !redirect {
 				err, redirect = cs.heartbeat()
+				if err != nil {
+					common.LWarn("heartbeat master error %v", err)
+					redirect = true
+				}
 			} else {
+				common.LInfo("deteted current master lose leader,begin leader discovery!")
+				cs.lastspin = time.Now()
 				err = cs.discoverMaster()
 				if err == ErrNotFoundMaster {
-					common.LTrace("lose communication to master err %v,spining retry", err)
+					common.LWarn("lose communication to master err %v,spining retry", err)
 					redirect = true
 				} else {
 					redirect = false
+					cs.spinidle += time.Since(cs.lastspin)
 				}
+				cs.spin++
 			}
 		}
 	}
@@ -217,10 +233,10 @@ func (cs *ChunkServer) heartbeat() (error, bool) {
 	abandoned := []types.ChunkHandle{}
 	for k, v := range cs.chunk {
 		v.RLock()
-		defer v.RUnlock()
 		if v.abandoned {
 			abandoned = append(abandoned, k)
 		}
+		v.RUnlock()
 	}
 	cs.lock.RUnlock()
 	arg := types.HeartbeatArg{
@@ -228,7 +244,7 @@ func (cs *ChunkServer) heartbeat() (error, bool) {
 		AbandondedChunks: abandoned,
 	}
 	var reply types.HeartbeatReply
-	err := xrpc.Call(cs.masters[cs.who], "Master.HeartBeat", &arg, &reply)
+	err := xrpc.Call(cs.masters[cs.who], "Master.RPCHeartbeat", &arg, &reply)
 	if err != nil {
 		return err, reply.Redirect
 	}
@@ -236,6 +252,8 @@ func (cs *ChunkServer) heartbeat() (error, bool) {
 	cs.lock.Lock()
 	cs.garbage = append(cs.garbage, reply.Garbage...)
 	cs.lock.Unlock()
+
+	common.LInfo("receive garbage from master %v,current %v", reply.Garbage, cs.garbage)
 	return nil, reply.Redirect
 }
 
@@ -250,10 +268,19 @@ func (cs *ChunkServer) garbageCollect() error {
 	return nil
 }
 
+func (cs *ChunkServer) RPCReportCurrentMasterAddr(args *types.ReportCurrentMasterAddrArg, reply *types.ReportCurrentMasterAddrReply) error {
+	cs.lock.RLock()
+	defer cs.lock.RUnlock()
+	reply.Master = cs.masters[cs.who]
+	reply.Spincount = cs.spin
+	reply.SpinIdle = cs.spinidle
+	return nil
+}
+
 func (cs *ChunkServer) RPCReportSelf(args *types.ReportSelfArg, reply *types.ReportSelfReply) error {
 	cs.lock.RLock()
-	defer cs.lock.Unlock()
-
+	defer cs.lock.RUnlock()
+	common.LInfo("chunkserver begin reportself state")
 	chunks := []types.PersiteChunkInfo{}
 	for k, v := range cs.chunk {
 		chunks = append(chunks, types.PersiteChunkInfo{
@@ -272,8 +299,16 @@ func (cs *ChunkServer) loadMetaData() error {
 	cs.lock.Lock()
 	defer cs.lock.Unlock()
 
-	filename := path.Join(cs.rootDir, MetaFileName)
-	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, FilePerm)
+	filename := path.Join(cs.rootDir, cs.metaName())
+	var (
+		file *os.File
+		err  error
+	)
+	if common.IsExist(filename) {
+		file, err = os.OpenFile(filename, os.O_WRONLY, FilePerm)
+	} else {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -302,13 +337,22 @@ func (cs *ChunkServer) persiteMetaData() error {
 	cs.lock.RLock()
 	defer cs.lock.RUnlock()
 
-	filename := path.Join(cs.rootDir, MetaFileName)
-	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, FilePerm)
+	filename := path.Join(cs.rootDir, cs.metaName())
+	var (
+		file *os.File
+		err  error
+	)
+	if common.IsExist(filename) {
+		err = os.Remove(filename)
+	}
+	if err != nil {
+		return err
+	}
+	file, err = os.Create(filename)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-
 	var metas []types.PersiteChunkInfo
 	for handle, ck := range cs.chunk {
 		metas = append(metas, types.PersiteChunkInfo{
@@ -462,7 +506,7 @@ func (cs *ChunkServer) RPCWriteChunk(args *types.WriteChunkArg, reply *types.Wri
 			}
 		}
 		if err != nil {
-			return errors.Join(errs...)
+			return err
 		}
 
 		err = <-wait
@@ -542,7 +586,7 @@ func (cs *ChunkServer) RPCAppendChunk(args *types.AppendChunkArg, reply *types.A
 			}
 		}
 		if err != nil {
-			return errors.Join(errs...)
+			return common.JoinErrors(errs...)
 		}
 
 		err = <-wait

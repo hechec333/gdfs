@@ -17,7 +17,7 @@ func main() {
 	flag.Int64Var(&id, "u", 0, "id ")
 	flag.Parse()
 	log.Println("Server Start With Role ", r)
-
+	// config.SetPath("..")
 	switch r {
 	case "m":
 		m := gdfs.NewMaster(id)

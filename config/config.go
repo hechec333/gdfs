@@ -18,6 +18,8 @@ type Node struct {
 	Name    string `xml:"name"`
 	Address string `xml:"address"`
 	Port    string `xml:"port"`
+	Debug   string `xml:"debug"`
+	Quromn  string `xml:"quromn"`
 }
 type ClusterConfig struct {
 	Master MasterConfig      `xml:"master"`
@@ -60,9 +62,6 @@ func newConfiguration() *Configuartion {
 
 var conf *Configuartion
 
-func init() {
-	conf = newConfiguration()
-}
 func GetClusterConfig() *Configuartion {
 	if conf == nil {
 		var mu sync.Mutex

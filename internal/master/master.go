@@ -3,7 +3,6 @@ package master
 import (
 	"bytes"
 	"encoding/gob"
-	"errors"
 	"fmt"
 	"gdfs/internal/common"
 	xrpc "gdfs/internal/common/rpc"
@@ -23,6 +22,7 @@ type Master struct {
 	sync.RWMutex
 	me          int // wal.Role()
 	masterAddrs []types.Addr
+	protocols   []types.Addr
 	dead        bool
 	shutdown    chan struct{}
 	//logger *LogOperationControlor
@@ -122,6 +122,7 @@ func MustNewAndServe(config *types.MetaServerServeConfig) *Master {
 	m := &Master{
 		me:          config.Me,
 		masterAddrs: config.Servers,
+		protocols:   config.Protocol,
 		shutdown:    make(chan struct{}),
 		cc:          NewChunkControlor(),
 		csc:         NewChunkServerControlor(),
@@ -131,14 +132,16 @@ func MustNewAndServe(config *types.MetaServerServeConfig) *Master {
 
 	m.init()
 
-	server := rpc.NewServer()
-	server.Register(m)
+	mserver := rpc.NewServer()
+	mserver.Register(m)
 
 	l, err := net.Listen("tcp", string(m.masterAddrs[m.me]))
 	if err != nil {
 		panic(err)
 	}
-	go xrpc.NewRpcAndServe(server, l, m.shutdown, xrpc.AcceptWithTimeOut(10*time.Second))
+	common.LInfo("starting rpc service port on %v", m.masterAddrs[m.me])
+
+	go xrpc.NewRpcAndServe(mserver, l, m.shutdown, xrpc.AcceptWithTimeOut(10*time.Second))
 	go m.GoBackgroundTask()
 	return m
 }
@@ -160,8 +163,17 @@ func (m *Master) init() {
 		common.LWarn("odd master cluster detecded!")
 	}
 
-	peers := xrpc.NewClientPeers(m.masterAddrs)
+	peers := xrpc.NewClientPeers(m.protocols)
 	m.wal = wal.StartWalPeer(m, peers, m.me, ips, common.MaxRaftState)
+
+	server := rpc.NewServer()
+	server.Register(m.wal.Getrf())
+	l, err := net.Listen("tcp", string(m.protocols[m.me]))
+	if err != nil {
+		panic(err)
+	}
+	common.LInfo("starting quromn address in %v", m.protocols[m.me])
+	go xrpc.NewRpcAndServe(server, l, m.shutdown)
 }
 
 func (m *Master) GoBackgroundTask() {
@@ -276,13 +288,15 @@ func (m *Master) serverCheck() error {
 	return nil
 }
 
-func (m *Master) RPCMasterCheck(arg *types.MasterCheckArg, reply *types.MasterCheckReply) error {
+func (m *Master) RPCCheckMaster(arg *types.MasterCheckArg, reply *types.MasterCheckReply) error {
+	//common.LInfo("receive master check from %v", arg.Server)
 	reply.Server = m.masterAddrs[m.me]
 	reply.Master = false
 	if term, is := m.wal.RoleState(); is {
 		reply.Master = true
 		reply.Term = term
 	}
+	common.LInfo("receive master check from %v,master %v", arg.Server, reply.Master)
 	return nil
 }
 
@@ -322,7 +336,7 @@ func (m *Master) reReplication(handle types.ChunkHandle) error {
 
 // RPCHeartbeat is called by chunkserver to let the master know that a chunkserver is alive
 func (m *Master) RPCHeartbeat(args types.HeartbeatArg, reply *types.HeartbeatReply) error {
-	common.LTrace("<Master> heartbeat from chunkserver %v", args.Address)
+	common.LInfo("<Master> heartbeat from chunkserver %v", args.Address)
 	_, is := m.wal.RoleState()
 	if !is {
 		reply.Redirect = true
@@ -331,6 +345,7 @@ func (m *Master) RPCHeartbeat(args types.HeartbeatArg, reply *types.HeartbeatRep
 	isFirst := m.csc.HeartBeat(args.Address, reply)
 
 	if isFirst { // if is first heartbeat, let chunkserver report itself
+		common.LInfo("new join chunkserver %v", args.Address)
 		var r types.ReportSelfReply
 		rsArg := types.ReportSelfArg{}
 		err := xrpc.Call(args.Address, "ChunkServer.RPCReportSelf", &rsArg, &r)
@@ -513,7 +528,7 @@ func (m *Master) RPCGetChunkHandle(args types.GetChunkHandleArg, reply *types.Ge
 		if len(errs) == len(addrs) {
 			// WARNING
 			//log.Warning("[ignored] An ignored error in RPCGetChunkHandle when create ", err, " in create chunk ", reply.Handle)
-			reply.Err = errors.Join(errs...)
+			reply.Err = common.JoinErrors(errs...)
 			common.LWarn("<Master> Create Chunk to %v errors %v", addrs, reply.Err)
 			return
 		}

@@ -2,6 +2,7 @@ package gdfs
 
 import (
 	"gdfs/config"
+	"gdfs/internal/common"
 	"gdfs/internal/master"
 	"gdfs/internal/types"
 	"os"
@@ -38,7 +39,9 @@ func NewMaster(uuid int64) *master.Master {
 
 	for _, v := range cc.Cluster.Master.Nodes {
 		cfg.Servers = append(cfg.Servers, types.Addr(v.Address+":"+v.Port))
+		cfg.Protocol = append(cfg.Protocol, types.Addr(v.Address+":"+v.Quromn))
 	}
 	cfg.Me = me
+	common.MusOpenLogFile(&cc.Cluster.Master.Nodes[me])
 	return master.MustNewAndServe(&cfg)
 }

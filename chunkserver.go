@@ -3,7 +3,9 @@ package gdfs
 import (
 	"gdfs/config"
 	chunkserver "gdfs/internal/chunkServer"
+	"gdfs/internal/common"
 	"gdfs/internal/types"
+	"log"
 	"os"
 	"strconv"
 )
@@ -13,11 +15,14 @@ func NewChunkServer(uuid int64) *chunkserver.ChunkServer {
 		RootDir: ".",
 	}
 	cc := config.GetClusterConfig()
-	for _, v := range cc.Cluster.Cs.Nodes {
+	var xcn *config.Node
+	for i, v := range cc.Cluster.Cs.Nodes {
 		if v.Uuid == uuid {
 			cfg.Address = types.Addr(v.Address + ":" + v.Port)
+			xcn = &cc.Cluster.Cs.Nodes[i]
 		}
 	}
+	log.Println(xcn)
 	if cfg.Address == "" {
 		id, ok := os.LookupEnv("GDFS_UUID")
 		if !ok {
@@ -38,5 +43,6 @@ func NewChunkServer(uuid int64) *chunkserver.ChunkServer {
 		cfg.MetaServers = append(cfg.MetaServers, types.Addr(v.Address+":"+v.Port))
 	}
 
+	common.MusOpenLogFile(xcn)
 	return chunkserver.MustNewAndServe(&cfg)
 }
