@@ -96,6 +96,12 @@ type Raft struct {
 	ElecFailTime      int
 	HeartBeatDuration time.Duration
 	ElecTimeout       ElecDealineTimer
+
+	Lease LeaderLease
+}
+
+func (rf *Raft) HasLeaderLease() bool {
+	return rf.Lease.OnLease()
 }
 
 // return currentTerm and whether this server
@@ -161,7 +167,6 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // 1 2 3
 // 1 2 3 4 5
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if index <= rf.LastSnapShotIndex || index > rf.getLastLogIndex() {
@@ -598,7 +603,7 @@ func min(a, b int) int {
 	}
 	return a
 }
-func (rf *Raft) LeaderSendAE(peer int, args *AppendEntriesArgs) {
+func (rf *Raft) LeaderSendAE(peer int, args *AppendEntriesArgs, done func(bool, int)) {
 	var resp AppendEntriesReply
 	// if rf.State != Leader {
 	// 	return
@@ -606,11 +611,11 @@ func (rf *Raft) LeaderSendAE(peer int, args *AppendEntriesArgs) {
 	ok := rf.sendAppendEntry(peer, args, &resp)
 
 	if !ok {
-		//DPrintf("[R][%v] [INFO] Server:%v SendAE to %v FAIL, Logs:%v", GetRole(rf.State), rf.me, peer, rf.logEntries)
-		//DPrintf("[R][Leader][INFO] Server:%v SendAE to %v FAIL", rf.me, peer)
 		common.LWarn("<Raft>[Leader] Server:%v SendAE to %v FAIL", rf.me, peer)
+		done(false, peer)
 		return //遭遇网络故障
 	}
+	done(true, peer)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -742,6 +747,16 @@ func (rf *Raft) LeaderCommit() {
 // check 标识是否是心跳包
 // 调用方必须持有锁
 func (rf *Raft) doAE(check bool) {
+	var count int32
+	aedone := func(stat bool, peer int) {
+		if !stat {
+			return
+		}
+		atomic.AddInt32(&count, 1)
+		if atomic.CompareAndSwapInt32(&count, int32(len(rf.peers)/2+1), 0) {
+			rf.Lease.keepLease(rf.ElecTimeout.TimeOuts)
+		}
+	}
 	for server := range rf.peers {
 		if server == rf.me {
 			rf.ElecTimeout.RefreshElecTimer()
@@ -776,7 +791,8 @@ func (rf *Raft) doAE(check bool) {
 				Entries:        logs,
 				LeaderCommitId: rf.CommitIndex,
 			}
-			go rf.LeaderSendAE(server, req)
+
+			go rf.LeaderSendAE(server, req, aedone)
 		}
 	}
 }
@@ -1066,6 +1082,7 @@ func Make(peers []*rpc.ClientEnd, me int,
 	rf.ApplyCond = sync.NewCond(&rf.mu)
 	rf.CommitIndex = 0
 	rf.LastAppliedIndex = 0
+	rf.Lease = LeaderLease{}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	if rf.VoteFor != 0 && rf.VoteFor != -1 {
