@@ -14,7 +14,6 @@ type CreateChunkArg struct {
 }
 
 type CreateChunkReply struct {
-	Err error
 }
 
 type CheckReplicaVersionArg struct {
@@ -149,7 +148,6 @@ type CreateFileArg struct {
 	Path Path
 }
 type CreateFileReply struct {
-	Err error
 }
 
 type DeleteFileArg struct {
@@ -166,12 +164,18 @@ type RenameFileArg struct {
 }
 type RenameFileReply struct{}
 
+type MkdirConfig struct {
+	Recursive bool
+}
+type MkdirOption func(*MkdirConfig)
+
 type MkdirArg struct {
 	ClientIdentity
-	Path Path
+	Cfg       MkdirConfig
+	Path      Path
+	Recursive bool
 }
 type MkdirReply struct {
-	Err error
 }
 
 type ListArg struct {
@@ -201,4 +205,12 @@ type ReportCurrentMasterAddrReply struct {
 	Master    Addr
 	SpinIdle  time.Duration
 	Spincount int
+}
+
+type SnapViewArg struct {
+	Path Path
+}
+
+type SnapViewReply struct {
+	Root []NodeView
 }

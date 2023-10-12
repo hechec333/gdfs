@@ -90,18 +90,18 @@ type Raft struct {
 	LastAppliedIndex int
 	State            int
 	//
-	NextIndex  []int
-	MatchIndex []int
-
+	NextIndex         []int
+	MatchIndex        []int
 	ElecFailTime      int
 	HeartBeatDuration time.Duration
 	ElecTimeout       ElecDealineTimer
+	Lease             LeaderLease
 
-	Lease LeaderLease
+	Event chan int
 }
 
 func (rf *Raft) HasLeaderLease() bool {
-	return rf.Lease.OnLease()
+	return len(rf.peers) == 1 || rf.Lease.OnLease()
 }
 
 // return currentTerm and whether this server
@@ -145,13 +145,26 @@ func (rf *Raft) readPersist(data []byte) {
 
 	r := bytes.NewBuffer(data)
 	d := gob.NewDecoder(r)
-	if d.Decode(&rf.CurrentTerm) != nil ||
-		d.Decode(&rf.VoteFor) != nil ||
-		d.Decode(&rf.logEntries) != nil ||
-		d.Decode(&rf.LastSnapShotIndex) != nil ||
-		d.Decode(&rf.LastSnapShotTerm) != nil {
-		//DPrintf("[Raft][WARN] read persite failed")
-		common.LWarn("<Raft> read persite failed")
+
+	if err := d.Decode(&rf.CurrentTerm); err != nil {
+		common.LWarn("<Raft> read Raft.CurrentTerm fail %v", err)
+		return
+	}
+	if err := d.Decode(&rf.VoteFor); err != nil {
+		common.LWarn("<Raft> read Raft.VoteFor fail %v", err)
+		return
+	}
+	if err := d.Decode(&rf.logEntries); err != nil {
+		common.LWarn("<Raft> read Raft.logEntries fail %v", err)
+		return
+	}
+	if err := d.Decode(&rf.LastSnapShotIndex); err != nil {
+		common.LWarn("<Raft> read Raft.LastSnapShotIndex fail %v", err)
+		return
+	}
+	if err := d.Decode(&rf.LastSnapShotTerm); err != nil {
+		common.LWarn("<Raft> read Raft.LastSnapShotTerm fail %v", err)
+		return
 	}
 	rf.CommitIndex = rf.LastSnapShotIndex //
 	rf.LastAppliedIndex = rf.CommitIndex
@@ -263,6 +276,7 @@ func (rf *Raft) LeaderSendSnapShot(server int, args *InstallSnapShotArg) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 		if reply.Term > rf.CurrentTerm {
+			// rf.notify(server)
 			rf.discoverNewTerm(reply.Term)
 		}
 		//rf.ElecTimeout.RefreshElecTimer()
@@ -360,6 +374,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) (err
 	defer rf.mu.Unlock()
 
 	if args.Term > rf.CurrentTerm {
+		// rf.notify(args.CandidateId)
 		rf.discoverNewTerm(args.Term)
 	}
 
@@ -526,6 +541,7 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 	rf.ElecTimeout.RefreshElecTimer()
 	if args.Term > rf.CurrentTerm {
 		rf.discoverNewTerm(args.Term)
+		rf.notify(args.LeaderId)
 		return
 	}
 	if rf.State == Candiate {
@@ -620,6 +636,7 @@ func (rf *Raft) LeaderSendAE(peer int, args *AppendEntriesArgs, done func(bool, 
 	defer rf.mu.Unlock()
 
 	if resp.Term > rf.CurrentTerm {
+		// rf.notify(peer)
 		rf.discoverNewTerm(resp.Term)
 		return
 	}
@@ -747,16 +764,23 @@ func (rf *Raft) LeaderCommit() {
 // check 标识是否是心跳包
 // 调用方必须持有锁
 func (rf *Raft) doAE(check bool) {
-	var count int32
+	var count int32 = 1 //发往自身的AE永远成功
 	aedone := func(stat bool, peer int) {
 		if !stat {
 			return
 		}
 		atomic.AddInt32(&count, 1)
 		if atomic.CompareAndSwapInt32(&count, int32(len(rf.peers)/2+1), 0) {
+			common.LInfo("<Raft>[Leader] Keeping Lease")
 			rf.Lease.keepLease(rf.ElecTimeout.TimeOuts)
 		}
 	}
+	if len(rf.peers) == 1 && !check {
+		rf.ElecTimeout.RefreshElecTimer()
+		rf.LeaderCommit()
+		aedone(true, 0)
+	}
+	rf.Lease.startpoint() //记录lease起始时间
 	for server := range rf.peers {
 		if server == rf.me {
 			rf.ElecTimeout.RefreshElecTimer()
@@ -885,7 +909,6 @@ func (rf *Raft) Campagin() {
 	args := rf.getPreVoteArg()
 	mux := &sync.Mutex{}
 	camCount := 1
-
 	for server := range rf.peers {
 		if server == rf.me {
 			//rf.ElecTimeout.RefreshElecTimer()
@@ -933,6 +956,7 @@ func (rf *Raft) CallRequestVote(server int, counter *int, args *RequestVoteArgs)
 		common.LWarn("<Raft>[%v] Server %v,Recevie RequestVoteReply: %v", GetRole(rf.State), rf.me, argv)
 		if argv.Term > rf.CurrentTerm {
 			//common.LInfo("[R][%v] Server: %v dicover higher Term: %v", GetRole(rf.State), rf.me, argv.Term)
+			// rf.notify(server)
 			rf.discoverNewTerm(argv.Term)
 			return
 		}
@@ -956,13 +980,14 @@ func (rf *Raft) CallRequestVote(server int, counter *int, args *RequestVoteArgs)
 func (rf *Raft) becomeLeader() {
 	common.LInfo("<Raft>[%v] become Leader,id:%v,Term:%v,logs:%v", GetRole(rf.State), rf.me, rf.CurrentTerm, rf.logEntries)
 	rf.State = Leader
+	rf.notify(rf.me)
 	for i := 0; i < len(rf.peers); i++ {
 		rf.NextIndex[i] = rf.getLastLogIndex() + 1
 		rf.MatchIndex[i] = rf.CommitIndex
 	}
 	rf.ElecFailTime = 0
 	//DPrintf("[R][%v][DEBUG] NextIndex: %v", GetRole(rf.State), rf.NextIndex)
-	common.LInfo("<Raft>[%v] become Leader,id:%v,Term:%v,logs:%v", GetRole(rf.State), rf.me, rf.CurrentTerm, rf.logEntries)
+	//common.LInfo("<Raft>[%v] become Leader,id:%v,Term:%v,logs:%v", GetRole(rf.State), rf.me, rf.CurrentTerm, rf.logEntries)
 }
 
 // 通知提交日志
@@ -1010,6 +1035,12 @@ func (rf *Raft) ticker() {
 		default:
 			if rf.ElecTimeout.Check() {
 				common.LInfo("<Raft>[%v][%v] election timeout!!,ready to campaign", GetRole(rf.State), rf.me)
+				if len(rf.peers) == 1 {
+					//rf.notify(rf.me)
+					common.LInfo("<Raft>[%v] single node cluster,free of prevote to become leader", rf.me)
+					rf.becomeLeader()
+					break
+				}
 				rf.Campagin()
 			}
 		}
@@ -1047,7 +1078,7 @@ func (ed *ElecDealineTimer) RefreshElecTimer() {
 	if dur <= 4*HeartBeat*time.Millisecond {
 		ed.Deadline = ed.Deadline.Add(ed.TimeOuts)
 	}
-	common.LTrace("<Raft> new exipre time in %v", ed.Deadline)
+	//common.LTrace("<Raft> new exipre time in %v", ed.Deadline)
 }
 
 // 判断选举时钟是否过期
@@ -1057,6 +1088,17 @@ func (ed *ElecDealineTimer) Check() bool {
 
 func (rf *Raft) GetRaftStateSize() int {
 	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) notify(who int) {
+	select {
+	case rf.Event <- who:
+	default:
+	}
+}
+
+func (rf *Raft) RoleChange() <-chan int {
+	return rf.Event
 }
 
 // 初始化一个Raft Peer
@@ -1083,6 +1125,7 @@ func Make(peers []*rpc.ClientEnd, me int,
 	rf.CommitIndex = 0
 	rf.LastAppliedIndex = 0
 	rf.Lease = LeaderLease{}
+	rf.Event = make(chan int)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	if rf.VoteFor != 0 && rf.VoteFor != -1 {

@@ -2,6 +2,16 @@ package types
 
 import "errors"
 
+func ErrEqual(t error, tt error) bool {
+	if t == nil {
+		if tt == nil {
+			return true
+		}
+		return false
+	}
+	return t == tt || t.Error() == tt.Error()
+}
+
 // sys error
 var (
 	ErrTimeOut       = errors.New("i/o timeout")
@@ -9,6 +19,11 @@ var (
 	ErrDuplicate     = errors.New("duplicate request")
 	ErrRetryOverSeed = errors.New("too many retry")
 	ErrFine          = error(nil)
+)
+
+// rpc error
+var (
+	ErrDialHup = errors.New("not found endpoint")
 )
 
 // logic error

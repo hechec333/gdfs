@@ -4,14 +4,10 @@ import (
 	"flag"
 	"fmt"
 	"gdfs/config"
-	"gdfs/internal/common/rpc"
 	"gdfs/internal/types"
-	"log"
 	"os"
 	"reflect"
-	"sync"
 	"text/tabwriter"
-	"time"
 )
 
 func main() {
@@ -72,80 +68,4 @@ func PrintChunkServerMaster(cs []config.Node) {
 		fmt.Fprintln(w)
 	}
 	w.Flush()
-}
-
-// -check m
-func MasterIdentity(m []config.Node) map[types.Addr]string {
-
-	var (
-		gm = make(map[types.Addr]string)
-		wg = sync.WaitGroup{}
-		mu sync.Mutex
-	)
-
-	for _, v := range m {
-		wg.Add(1)
-		go func(peer string) {
-			defer wg.Done()
-			arg := types.MasterCheckArg{
-				Server: ":3611",
-			}
-			argv := types.MasterCheckReply{}
-			err := rpc.Call(types.Addr(peer), "Master.RPCCheckMaster", &arg, &argv, rpc.CallWithTimeOut(3*time.Second))
-			mu.Lock()
-			defer mu.Unlock()
-			if err == rpc.ErrTimeOut {
-				gm[types.Addr(peer)] = "Partition"
-				return
-			}
-			if err != nil {
-				gm[types.Addr(peer)] = "Unknown Error"
-				return
-			}
-
-			if argv.Master {
-				gm[types.Addr(peer)] = "Master"
-			} else {
-				gm[types.Addr(peer)] = "Follower"
-			}
-		}(v.Address + ":" + v.Port)
-	}
-
-	wg.Wait()
-	return gm
-}
-
-// -check c
-func ChunkServerCurrentMaster(cs []config.Node) map[types.Addr]*types.ReportCurrentMasterAddrReply {
-	var (
-		gm = make(map[types.Addr]*types.ReportCurrentMasterAddrReply)
-		wg = sync.WaitGroup{}
-		mu sync.Mutex
-	)
-
-	for _, v := range cs {
-		wg.Add(1)
-		go func(peer string) {
-			defer wg.Done()
-			arg := types.ReportCurrentMasterAddrArg{}
-			argv := types.ReportCurrentMasterAddrReply{}
-			err := rpc.Call(types.Addr(peer), "ChunkServer.RPCReportCurrentMasterAddr", &arg, &argv, rpc.CallWithTimeOut(3*time.Second))
-			mu.Lock()
-			defer mu.Unlock()
-			if err == rpc.ErrTimeOut {
-				gm[types.Addr(peer)] = nil
-				return
-			}
-			if err != nil {
-				log.Printf("call %v error %v", peer, err)
-				return
-			}
-
-			gm[types.Addr(peer)] = &argv
-		}(v.Address + ":" + v.Port)
-	}
-
-	wg.Wait()
-
-	return gm
 }

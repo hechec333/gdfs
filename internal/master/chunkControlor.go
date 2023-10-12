@@ -341,8 +341,8 @@ func (cc *ChunkControlor) CreateChunk(do *wal.LogOpLet, path types.Path, servers
 			err := rpc.Call(peer, "ChunkServer.CreateChunk", &args, &resp)
 			ck.Lock()
 			defer ck.Unlock()
-			if err != nil || resp.Err != nil {
-				errs = append(errs, resp.Err)
+			if err != nil {
+				errs = append(errs, err)
 			} else {
 				ck.Replicas = append(ck.Replicas, peer)
 			}

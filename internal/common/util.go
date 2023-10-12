@@ -20,6 +20,9 @@ import (
 )
 
 func PartionPath(path types.Path) ([]string, string) {
+	if path == "/" {
+		return []string{""}, ""
+	}
 	if path[len(path)-1] == '/' {
 		path = path[:len(path)-1]
 	}

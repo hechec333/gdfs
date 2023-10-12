@@ -33,6 +33,14 @@ type FileInfo struct {
 	Length int64
 }
 
+type NodeView struct {
+	Path    Path
+	IsDir   bool
+	Chunks  int64
+	Length  int64
+	Handles []ChunkHandle
+}
+
 type LeaseInfo struct {
 	Primary Addr
 	Backups []Addr

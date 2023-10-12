@@ -21,6 +21,7 @@ import (
 type Master struct {
 	sync.RWMutex
 	me          int // wal.Role()
+	who         int // master index
 	masterAddrs []types.Addr
 	protocols   []types.Addr
 	dead        bool
@@ -38,13 +39,13 @@ type Master struct {
 func (m *Master) ServeApplyCommand(msg raft.ApplyMsg) (error, error) {
 	m.Lock()
 	defer m.Unlock()
-	common.LTrace("<Master> receive apply command from raft")
+	common.LTrace("<Master%v> receive apply command from raft", m.me)
 	op := msg.Command.(wal.LogOp)
 
 	err := m.dispatch(&op)
 	return nil, err
 }
-func (m *Master) chunkDispath(log *types.ChunkLogImpl) error {
+func (m *Master) chunkDispath(log types.ChunkLogImpl) error {
 	switch log.CommandType {
 	case types.CommandCreate:
 		return m.cc.applyCreateChunk(log.Path, log.Chunk)
@@ -56,10 +57,15 @@ func (m *Master) chunkDispath(log *types.ChunkLogImpl) error {
 		return types.ErrUnknownOperation
 	}
 }
-func (m *Master) nsDispatch(log *types.NsLogImpl) error {
-	switch log.CommandType {
+func (m *Master) nsDispatch(log types.NsLogImpl) error {
+	switch log.CommandType & 0xffff {
 	case types.CommandCreate:
-		return m.ns.applyCreate(log.Path, log.File)
+		if log.CommandType&types.OP_FILE == types.OP_FILE {
+			return m.ns.applyCreatef(log.Path, log.File)
+		}
+		if log.CommandType&types.OP_DIC == types.OP_DIC {
+			return m.ns.applyCreated(log.Path, log.Dics)
+		}
 	case types.CommandDelete:
 		return m.ns.applyDelete(log.Path, log.File)
 	case types.CommandUpdate:
@@ -67,12 +73,14 @@ func (m *Master) nsDispatch(log *types.NsLogImpl) error {
 	default:
 		return types.ErrUnknownOperation
 	}
+
+	return types.ErrUnknownOperation
 }
 func (m *Master) dispatch(log *wal.LogOp) error {
 	if log.OpType == types.ChunkLog {
-		return m.chunkDispath(log.Log.(*types.ChunkLogImpl))
+		return m.chunkDispath(log.Log.(types.ChunkLogImpl))
 	} else if log.OpType == types.NsLog {
-		return m.nsDispatch(log.Log.(*types.NsLogImpl))
+		return m.nsDispatch(log.Log.(types.NsLogImpl))
 	} else {
 		return types.ErrUnknownLog
 	}
@@ -140,7 +148,10 @@ func MustNewAndServe(config *types.MetaServerServeConfig) *Master {
 		panic(err)
 	}
 	common.LInfo("starting rpc service port on %v", m.masterAddrs[m.me])
-
+	go m.wal.SubscribeRoleChange(func(l bool, who int) {
+		common.LWarn("<Master%v> role change new leader %v", who)
+		m.who = who
+	})
 	go xrpc.NewRpcAndServe(mserver, l, m.shutdown, xrpc.AcceptWithTimeOut(10*time.Second))
 	go m.GoBackgroundTask()
 	return m
@@ -180,18 +191,18 @@ func (m *Master) GoBackgroundTask() {
 	snapTicker := time.NewTicker(common.SnapInterval)
 	scanTicker := time.NewTicker(common.LazyCollectInterval)
 	checkTicker := time.NewTicker(common.CheckInterval)
-	common.LInfo("<Master> init background taskgroup [snapshot,scanning,selfcheck]")
+	common.LInfo("<Master%v> init background taskgroup [snapshot,scanning,selfcheck]", m.me)
 	for {
 		var err error
 		select {
 		case <-snapTicker.C:
-			common.LInfo("<Master> ready to save snapshot")
+			common.LInfo("<Master%v> ready to save snapshot", m.me)
 			m.wal.NotifySnapShot()
 		case <-scanTicker.C:
-			common.LInfo("<Master> ready to begin garbage collect")
+			common.LInfo("<Master%v> ready to begin garbage collect", m.me)
 			err = m.lazyCollector()
 		case <-checkTicker.C:
-			common.LInfo("<Master> ready to begin self check")
+			common.LInfo("<Master%v> ready to begin self check", m.me)
 			err = m.serverCheck()
 		case <-m.shutdown:
 			return
@@ -288,6 +299,11 @@ func (m *Master) serverCheck() error {
 	return nil
 }
 
+func (m *Master) Redirect() bool {
+	rf := m.wal.Getrf()
+	return rf.Lease.OnLease()
+}
+
 func (m *Master) RPCCheckMaster(arg *types.MasterCheckArg, reply *types.MasterCheckReply) error {
 	//common.LInfo("receive master check from %v", arg.Server)
 	reply.Server = m.masterAddrs[m.me]
@@ -336,7 +352,7 @@ func (m *Master) reReplication(handle types.ChunkHandle) error {
 
 // RPCHeartbeat is called by chunkserver to let the master know that a chunkserver is alive
 func (m *Master) RPCHeartbeat(args types.HeartbeatArg, reply *types.HeartbeatReply) error {
-	common.LInfo("<Master> heartbeat from chunkserver %v", args.Address)
+	common.LInfo("<Master%v> heartbeat from chunkserver %v", m.me, args.Address)
 	_, is := m.wal.RoleState()
 	if !is {
 		reply.Redirect = true
@@ -365,11 +381,11 @@ func (m *Master) RPCHeartbeat(args types.HeartbeatArg, reply *types.HeartbeatRep
 
 			if v.Version == version {
 				//log.Infof("Master receive chunk %v from %v", v.Handle, args.Address)
-				common.LTrace("<Master> commit chunk %v from ck %v", v.ChunkHandle, args.Address)
+				common.LTrace("<Master%v> commit chunk %v from ck %v", m.me, v.ChunkHandle, args.Address)
 				m.cc.RegisterReplicas(v.ChunkHandle, args.Address)
 				m.csc.AddChunk([]types.Addr{args.Address}, v.ChunkHandle)
 			} else {
-				common.LTrace("<Master> discard chunk %v,inequal version set", v.ChunkHandle)
+				common.LTrace("<Master%v> discard chunk %v,inequal version set", m.me, v.ChunkHandle)
 			}
 		}
 	}
@@ -417,6 +433,12 @@ func (m *Master) RPCGetPrimaryAndSecondaries(args types.GetPrimaryAndSecondaries
 
 // RPCGetReplicas is called by client to find all chunkserver that holds the chunk.
 func (m *Master) RPCGetReplicas(args types.GetReplicasArg, reply *types.GetReplicasReply) error {
+	if !m.wal.CheckLocalReadStat() {
+		m.RLock()
+		who := m.masterAddrs[m.who]
+		m.RUnlock()
+		return xrpc.Call(who, "Master.RPCGetReplicas", args, reply)
+	}
 	servers, err := m.cc.GetReplicas(args.Handle)
 	if err != nil {
 		return err
@@ -435,9 +457,11 @@ func (m *Master) RPCCreateFile(args types.CreateFileArg, reply *types.CreateFile
 			err = errz.(error)
 		}
 	}()
+	if _, l := m.wal.RoleState(); m.who != m.me || !l {
+		return types.ErrRedirect
+	}
 	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
-	reply.Err = m.ns.CreateFileImpl(let, args.Path)
-	return
+	return m.ns.CreateFileImpl(let, args.Path)
 }
 
 // RPCDelete is called by client to delete a file
@@ -447,6 +471,9 @@ func (m *Master) RPCDeleteFile(args types.DeleteFileArg, reply *types.DeleteFile
 			err = errz.(error)
 		}
 	}()
+	if _, l := m.wal.RoleState(); m.who != m.me || !l {
+		return types.ErrRedirect
+	}
 	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
 	reply.Err = m.ns.DeleteFileImpl(let, args.Path)
 	return
@@ -465,13 +492,23 @@ func (m *Master) RPCMkdir(args types.MkdirArg, reply *types.MkdirReply) (err err
 			err = errz.(error)
 		}
 	}()
+	if _, l := m.wal.RoleState(); m.who != m.me || !l {
+		return types.ErrRedirect
+	}
+
 	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
-	reply.Err = m.ns.MkdirImpl(let, args.Path)
+	err = m.ns.MkdirImpl(let, args.Path, args.Cfg.Recursive)
 	return
 }
 
 // RPCList is called by client to list all files in specific directory
 func (m *Master) RPCList(args types.ListArg, reply *types.ListReply) error {
+	if !m.wal.CheckLocalReadStat() {
+		m.RLock()
+		who := m.masterAddrs[m.who]
+		m.RUnlock()
+		return xrpc.Call(who, "Master.RPCList", args, reply)
+	}
 	var err error
 	reply.Files, err = m.ns.GetList(args.Path)
 	return err
@@ -479,6 +516,12 @@ func (m *Master) RPCList(args types.ListArg, reply *types.ListReply) error {
 
 // RPCGetFileInfo is called by client to get file information
 func (m *Master) RPCGetFileInfo(args types.GetFileInfoArg, reply *types.GetFileInfoReply) error {
+	if !m.wal.CheckLocalReadStat() {
+		m.RLock()
+		who := m.masterAddrs[m.who]
+		m.RUnlock()
+		return xrpc.Call(who, "Master.RPCGetFileInfo", args, reply)
+	}
 	info, err := m.ns.GetFileInfoImpl(args.Path)
 	if info.IsDir {
 		err = fmt.Errorf("path %v is dir", args.Path)
@@ -529,7 +572,7 @@ func (m *Master) RPCGetChunkHandle(args types.GetChunkHandleArg, reply *types.Ge
 			// WARNING
 			//log.Warning("[ignored] An ignored error in RPCGetChunkHandle when create ", err, " in create chunk ", reply.Handle)
 			reply.Err = common.JoinErrors(errs...)
-			common.LWarn("<Master> Create Chunk to %v errors %v", addrs, reply.Err)
+			common.LWarn("<Master%v> Create Chunk to %v errors %v", m.me, addrs, reply.Err)
 			return
 		}
 
@@ -539,4 +582,48 @@ func (m *Master) RPCGetChunkHandle(args types.GetChunkHandleArg, reply *types.Ge
 	}
 
 	return
+}
+
+func (m *Master) RPCSnapView(arg types.SnapViewArg, argv *types.SnapViewReply) error {
+	if _, l := m.wal.RoleState(); m.who != m.me || !l {
+		return types.ErrRedirect
+	}
+	spins := 0
+	for !m.wal.CheckLocalReadStat() {
+		common.LWarn("<Master%v> not in leader lease time", m.me)
+		time.Sleep(10 * time.Millisecond)
+		spins++
+		if spins >= 10 {
+			return types.ErrRedirect
+		}
+	}
+	// 获取指定结点的视图
+	tree, err := m.ns.NodeScan(arg.Path, nil)
+
+	if err != nil {
+		return err
+	}
+
+	nodes := make([]types.NodeView, len(tree))
+	for idx, v := range tree {
+		nodes[idx] = types.NodeView{
+			Path:    types.Path(v.Name),
+			IsDir:   true,
+			Handles: nil,
+		}
+		if v.IsDir {
+			continue
+		}
+		nodes[idx].Handles = make([]types.ChunkHandle, 0)
+		for i := 0; i < int(v.Chunks); i++ {
+			h, err := m.cc.GetChunk(types.Path(v.Name), i)
+			if err != nil {
+				return err
+			}
+			nodes[idx].Handles = append(nodes[idx].Handles, h)
+		}
+	}
+	argv.Root = nodes
+
+	return nil
 }

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	chunkserver "gdfs/internal/chunkServer"
 	"gdfs/internal/common"
@@ -8,10 +9,64 @@ import (
 	"gdfs/internal/types"
 	"io"
 	"math/rand"
+	"path"
 	"reflect"
 	"sync"
 	"time"
 )
+
+type FileFlag uint16
+
+const (
+	O_CREATE FileFlag = iota << 1
+	O_APPEND
+	O_RWONLY
+)
+
+type Writer struct {
+	sync.RWMutex
+	c    *Client
+	path types.Path
+	next int64
+}
+
+func (w *Writer) Write(b []byte) (int, error) {
+	return w.c.Write(w.path, w.next, b)
+}
+
+func (w *Writer) Seek(index int64) {
+	w.next = index
+}
+
+type Appender struct {
+	sync.RWMutex
+	c    *Client
+	path types.Path
+	next int64
+}
+
+func (w *Appender) Write(b []byte) (int, error) {
+	w.Lock()
+	defer w.Unlock()
+	n, err := w.c.Append(w.path, b)
+	wb := n - w.next
+	return int(wb), err
+}
+
+type Reader struct {
+	sync.RWMutex
+	c    *Client
+	path types.Path
+	seek int64
+}
+
+func (r *Reader) Read(b []byte) (int, error) {
+	return r.c.Read(r.path, r.seek, b)
+}
+
+func (r *Reader) Seek(index int64) {
+	r.seek = index
+}
 
 // Client struct is the types client-side driver
 type Client struct {
@@ -33,7 +88,18 @@ func NewClient(master []types.Addr) *Client {
 	cli.leaseBuf = newLeaseBuffer(cli, common.LeaseBufTick)
 	return cli
 }
-
+func (c *Client) Do(ctx context.Context, service string, arg, reply any) error {
+	ch := make(chan error, 1)
+	go func() {
+		ch <- c.do(service, arg, reply)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-ch:
+		return err
+	}
+}
 func (c *Client) do(service string, arg any, reply any) error {
 	c.mu.Lock()
 	seq := c.seq + 1
@@ -55,19 +121,25 @@ func (c *Client) do(service string, arg any, reply any) error {
 	for {
 		server := c.master[next]
 		err := rpc.Call(server, service, arg, reply)
-		if err == types.ErrDuplicate {
+		if types.ErrEqual(err, types.ErrDuplicate) {
 			return types.ErrDuplicate
 		}
-		if err == types.ErrTimeOut || err == types.ErrRedirect {
-			next := (next + 1) % len(c.master)
+		// fmt.Println(types.ErrEqual(err, types.ErrRedirect))
+		if types.ErrEqual(err, types.ErrTimeOut) || types.ErrEqual(err, types.ErrRedirect) {
+			next = (next + 1) % len(c.master)
 			if next == c.lastleader {
 				time.Sleep(50 * time.Millisecond)
 			}
 			times++
 			if times >= common.MaxClientRetry*len(c.master) {
+				common.LInfo("%v", times)
 				return types.ErrRetryOverSeed
 			}
+			common.LInfo("<Client> redirect to next master next %v", next)
 			continue
+		}
+		if err != nil {
+			return err
 		}
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -85,11 +157,11 @@ func (c *Client) Create(path types.Path) error {
 		ClientIdentity: types.ClientIdentity{},
 		Path:           path,
 	}
-	err := c.do("Master.RPCCreateFile", &arg, &reply)
-	if err != nil {
-		return err
-	}
-	return reply.Err
+	return c.do("Master.RPCCreateFile", &arg, &reply)
+}
+
+func (c *Client) OpenFile(path types.Path, mode int32) (*File, error) {
+
 }
 
 // Delete is a client API, deletes a file
@@ -106,17 +178,25 @@ func (c *Client) Delete(path types.Path) error {
 	return reply.Err
 }
 
+func WithForce() types.MkdirOption {
+	return func(c *types.MkdirConfig) {
+		c.Recursive = true
+	}
+}
+
 // Mkdir is a client API, makes a directory
-func (c *Client) Mkdir(path types.Path) error {
+func (c *Client) Mkdir(path types.Path, opt ...types.MkdirOption) error {
+	var cfg types.MkdirConfig
+	for _, v := range opt {
+		v(&cfg)
+	}
 	var reply types.MkdirReply
 	arg := types.MkdirArg{
+		Cfg:  cfg,
 		Path: path,
 	}
 	err := c.do("Master.RPCMkdir", &arg, &reply)
-	if err != nil {
-		return err
-	}
-	return reply.Err
+	return err
 }
 
 // List is a client API, lists all files in specific directory
@@ -184,18 +264,18 @@ func (c *Client) Read(path types.Path, offset int64, data []byte) (n int, err er
 }
 
 // Write is a client API. write data to file at specific offset
-func (c *Client) Write(path types.Path, offset int64, data []byte) error {
+func (c *Client) Write(path types.Path, offset int64, data []byte) (int, error) {
 	var f types.GetFileInfoReply
 	arg := &types.GetFileInfoArg{
 		Path: path,
 	}
 	err := c.do("Master.RPCGetFileInfo", &arg, &f)
 	if err != nil {
-		return err
+		return -1, err
 	}
 
 	if int64(offset/common.MaxChunkSize) > f.Chunks {
-		return fmt.Errorf("write offset exceeds file size")
+		return -1, fmt.Errorf("write offset exceeds file size")
 	}
 
 	begin := 0
@@ -205,7 +285,7 @@ func (c *Client) Write(path types.Path, offset int64, data []byte) error {
 
 		handle, err := c.GetChunkHandle(path, int(index))
 		if err != nil {
-			return err
+			return -1, err
 		}
 
 		writeMax := int(common.MaxChunkSize - chunkOffset)
@@ -223,7 +303,7 @@ func (c *Client) Write(path types.Path, offset int64, data []byte) error {
 			}
 		}
 		if err != nil {
-			return err
+			return -1, err
 		}
 
 		offset += int64(writeLen)
@@ -234,7 +314,7 @@ func (c *Client) Write(path types.Path, offset int64, data []byte) error {
 		}
 	}
 
-	return nil
+	return begin, nil
 }
 
 // Append is a client API, append data to file
@@ -421,4 +501,27 @@ func (c *Client) AppendChunk(handle types.ChunkHandle, data []byte) (offset int6
 	}
 
 	return a.Offset, a.Err
+}
+
+func (c *Client) Walk(xpath types.Path, fn func(p types.Path)) error {
+	arg := types.SnapViewArg{}
+	argv := types.SnapViewReply{}
+
+	if xpath == "/" {
+		arg.Path = "/"
+	} else {
+		arg.Path = types.Path(path.Join(string(xpath), "x"))
+	}
+	err := c.do("Master.RPCSnapView", arg, &argv)
+
+	if err != nil {
+		return err
+	}
+
+	for _, v := range argv.Root {
+		if fn != nil {
+			fn(v.Path)
+		}
+	}
+	return nil
 }

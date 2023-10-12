@@ -70,7 +70,7 @@ func (ce *ClientEnd) Call(service string, args any, reply any, opts ...CallOptio
 		err := ce.dial() //是否需要超时管理,建立连接
 		if err != nil {
 			common.LFail("rpc dial error %v", err)
-			return err
+			return types.ErrDialHup
 		}
 	}
 	cf := RpcClientConfig{}

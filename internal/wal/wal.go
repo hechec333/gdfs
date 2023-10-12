@@ -14,6 +14,10 @@ import (
 	"time"
 )
 
+func init() {
+	gob.Register(LogOp{})
+}
+
 type ICommandLet interface {
 	ServeApplyCommand(raft.ApplyMsg) (error, error) //
 	ServeSnapShot() ([]byte, error)
@@ -112,7 +116,7 @@ func (lol *LogOpLet) NsStartCtx(ctx context.Context, cmd interface{}) error {
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-ctx.Done(): //context dealine execeed!
 			return ctx.Err()
 		case err := <-ch:
 			return err
@@ -297,6 +301,20 @@ func (wal *WriteAheadLog) Stop() {
 func (wal *WriteAheadLog) stoped() bool {
 	z := atomic.LoadInt32(&wal.dead)
 	return z == 1
+}
+func (wal *WriteAheadLog) SubscribeRoleChange(f func(l bool, who int)) {
+	go func() {
+		for {
+			e := <-wal.rf.Event
+			_, l := wal.RoleState()
+			f(l, e)
+		}
+	}()
+}
+
+func (wal *WriteAheadLog) CheckLocalReadStat() bool {
+	_, l := wal.RoleState()
+	return l && wal.rf.HasLeaderLease()
 }
 
 func (wal *WriteAheadLog) Getrf() *raft.Raft {

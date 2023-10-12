@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-var ErrPathNotFound = "Path Not Found"
+var ErrPathNotFound error = errors.New("Path Not Found")
 
 type NameSpaceControlor struct {
 	root *NameSpaceTreeNode
@@ -32,7 +32,7 @@ type NameSpaceTreeNode struct {
 }
 
 func NewNsTree(root types.Path) *NameSpaceTreeNode {
-	paths := strings.Split(string(root), "/")
+	paths := strings.Split(string(root), "/")[1:]
 	ns := &NameSpaceTreeNode{
 		isDir: true,
 		name:  paths[0],
@@ -75,9 +75,12 @@ func (nsc *NameSpaceControlor) lockUpperPath(path types.Path, lock bool) ([]stri
 	}
 
 	if len(parent) != depth {
-		return parent[:depth], root, errors.New(ErrPathNotFound)
+		return parent[:depth], root, ErrPathNotFound
 	}
-	root.RUnlock() //不锁定父级
+	// if lock {
+	// 	//root.RLock()
+	// 	//root.RUnlock() //不锁定父级
+	// }
 	return parent, root, nil
 }
 
@@ -96,24 +99,25 @@ func (nsc *NameSpaceControlor) unlockUpperPath(path types.Path) {
 					stack[depth] = vv
 					depth++
 					root = vv
+					break
 				}
 			}
 		}
 	}
-
-	for i := depth - 1; i >= 0; i-- {
+	if depth == 1 {
+		root.RUnlock()
+	}
+	for i := depth - 2; i >= 0; i-- {
 		stack[i].RUnlock()
 	}
 }
 
 func (nsc *NameSpaceControlor) CreateFileImpl(do *wal.LogOpLet, path types.Path) error {
 	_, cwd, err := nsc.lockUpperPath(path, true)
-
+	defer nsc.unlockUpperPath(path)
 	if err != nil {
 		return err
 	}
-
-	defer nsc.unlockUpperPath(path)
 
 	cwd.Lock()
 	defer cwd.Unlock()
@@ -124,7 +128,7 @@ func (nsc *NameSpaceControlor) CreateFileImpl(do *wal.LogOpLet, path types.Path)
 	// 	chunks: 0,
 	// 	length: 0,
 	// })
-	err = nsc.MustCreateFile(do, cwd, common.GetFileNameWithExt(path))
+	err = nsc.MustCreateFile(do, path, common.GetFileNameWithExt(path))
 	if err != nil {
 		panic(err)
 	}
@@ -158,9 +162,44 @@ func (nsc *NameSpaceControlor) DeleteFileImpl(do *wal.LogOpLet, xpath types.Path
 	return nil
 }
 
-func (nsc *NameSpaceControlor) MkdirImpl(do *wal.LogOpLet, path types.Path) error {
-	_, cwd, err := nsc.lockUpperPath(path, true)
+func (nsc *NameSpaceControlor) MkdirImpl(do *wal.LogOpLet, path types.Path, r bool) error {
+	p, cwd, err := nsc.lockUpperPath(path, true)
 	if err != nil {
+		if err == ErrPathNotFound && r {
+			var (
+				idx int
+			)
+			xps := strings.Split(string(path), "/")
+			for i, v := range xps {
+				if i >= len(p) || v != p[i] {
+					break
+				}
+				idx++
+			}
+			nsc.unlockUpperPath(path)
+			rest := xps[idx:]
+			cwd.Lock()
+			cr := &NameSpaceTreeNode{
+				isDir: true,
+				name:  rest[0],
+			}
+			xr := cr
+			for _, v := range rest[1:] {
+				cr.children = append(cr.children, &NameSpaceTreeNode{
+					name:  v,
+					isDir: true,
+				})
+				cr = cr.children[0]
+			}
+			defer cwd.Unlock()
+			var xpt string = strings.Join(xps[:idx], "/")
+			// if idx == 1 {
+			// 	xpt = "/"
+			// } else {
+			// 	xpt = strings.Join(xps[:idx], "/")
+			// }
+			err = nsc.MustMkdir(do, types.Path(xpt), xr)
+		}
 		return err
 	}
 	defer nsc.unlockUpperPath(path)
@@ -169,7 +208,10 @@ func (nsc *NameSpaceControlor) MkdirImpl(do *wal.LogOpLet, path types.Path) erro
 	defer cwd.Unlock()
 	filename := common.GetFileNameWithExt(path)
 
-	err = nsc.MustMkdir(do, cwd, filename)
+	err = nsc.MustMkdir(do, path, &NameSpaceTreeNode{
+		name:  filename,
+		isDir: true,
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -284,6 +326,36 @@ func (nsc *NameSpaceControlor) GetFileInfoImpl(path types.Path) (types.PathInfo,
 
 	return info, fmt.Errorf("file %v not found", path)
 }
+func (n *NameSpaceTreeNode) bfs(prefix string, f func(path types.Path, n *NameSpaceTreeNode)) {
+	n.RLock()
+	defer n.RUnlock()
+	for i := range n.children {
+		t := path.Join(prefix, n.children[i].name)
+		f(types.Path(t), n.children[i])
+		n.children[i].bfs(t, f)
+	}
+}
+func (nsc *NameSpaceControlor) NodeScan(root types.Path, f func(path types.Path)) ([]types.PersiteTreeNode, error) {
+	array := []types.PersiteTreeNode{}
+
+	_, cwd, err := nsc.lockUpperPath(root, false)
+	if err != nil {
+		return nil, err
+	}
+	cwd.bfs("", func(path types.Path, n *NameSpaceTreeNode) {
+		array = append(array, types.PersiteTreeNode{
+			Name:   string(path),
+			IsDir:  n.isDir,
+			Length: n.length,
+			Chunks: n.chunks,
+		})
+		if f != nil {
+			f(path)
+		}
+	})
+
+	return array, nil
+}
 
 func (nsc *NameSpaceControlor) GetDeletedFile() []types.FileInfo {
 	files := []types.FileInfo{}
@@ -354,20 +426,20 @@ func (nst *NameSpaceTreeNode) GetChild(name string) (*NameSpaceTreeNode, bool) {
 	return nil, false
 }
 
-func (nst *NameSpaceTreeNode) Serial(array []types.PersiteTreeNode) int {
+func (nst *NameSpaceTreeNode) Serial(array *[]types.PersiteTreeNode) int {
 	st := types.PersiteTreeNode{
 		IsDir:    nst.isDir,
 		Name:     nst.name,
 		Chunks:   nst.chunks,
 		Length:   nst.length,
-		Children: make([]int, len(nst.children)),
+		Children: make([]int, 0),
 	}
-	index := len(array)
-	array = append(array, st)
+	index := len(*array)
+	*array = append(*array, st)
 	for _, v := range nst.children {
 		st.Children = append(st.Children, v.Serial(array))
 	}
-	array[index] = st
+	(*array)[index] = st
 	return index
 }
 
@@ -388,7 +460,7 @@ func (nsc *NameSpaceControlor) SavePersiteState() []types.PersiteTreeNode {
 	nsc.root.RLock()
 	defer nsc.root.RUnlock()
 	array := []types.PersiteTreeNode{}
-	nsc.root.Serial(array)
+	nsc.root.Serial(&array)
 
 	return array
 }
@@ -416,7 +488,22 @@ func (nsc *NameSpaceControlor) applyChangeFileInfo(path types.Path, meta types.P
 	}
 	return nil
 }
-func (nsc *NameSpaceControlor) applyCreate(path types.Path, meta types.PersiteTreeNode) error {
+func (nsc *NameSpaceControlor) applyCreated(path types.Path, meta []types.PersiteTreeNode) error {
+	_, cwd, err := nsc.lockUpperPath(path, false)
+	if err != nil {
+		return err
+	}
+
+	st := NameSpaceTreeNode{}
+
+	st.Deserial(meta, 0)
+
+	cwd.children = append(cwd.children, &st)
+
+	return nil
+}
+
+func (nsc *NameSpaceControlor) applyCreatef(path types.Path, meta types.PersiteTreeNode) error {
 	_, cwd, err := nsc.lockUpperPath(path, false)
 	if err != nil {
 		return err
@@ -456,7 +543,7 @@ func (nst *NameSpaceTreeNode) MustAddLength(do *wal.LogOpLet, path types.Path, l
 		Chunks: nst.chunks,
 	}
 	nst.RUnlock()
-	ctx, h := context.WithTimeout(context.TODO(), 1*time.Second)
+	ctx, h := context.WithTimeout(context.TODO(), 3*time.Second)
 	defer h()
 	return do.NsStartCtx(ctx, log)
 }
@@ -469,22 +556,21 @@ func (nst *NameSpaceTreeNode) MustAddChunks(do *wal.LogOpLet, path types.Path, c
 		Chunks: nst.chunks + chunks,
 	}
 	nst.RUnlock()
-	ctx, h := context.WithTimeout(context.TODO(), 1*time.Second)
+	ctx, h := context.WithTimeout(context.TODO(), 3*time.Second)
 	defer h()
 	return do.NsStartCtx(ctx, log)
 }
-func (nsc *NameSpaceControlor) MustMkdir(do *wal.LogOpLet, cwd *NameSpaceTreeNode, name string) error {
-	log := types.NsLogImpl{
-		CommandType: types.CommandCreate,
-		Path:        types.Path(cwd.name + "/" + name),
-		File: types.PersiteTreeNode{
-			IsDir:  true,
-			Name:   name,
-			Length: 0,
-			Chunks: 0,
-		},
+func (nsc *NameSpaceControlor) MustMkdir(do *wal.LogOpLet, path types.Path, newn *NameSpaceTreeNode) error {
+	var children []types.PersiteTreeNode
+	if newn.children != nil {
+		newn.Serial(&children)
 	}
-	ctx, h := context.WithTimeout(context.TODO(), 1*time.Second)
+	log := types.NsLogImpl{
+		CommandType: types.CommandCreate | types.OP_DIC,
+		Path:        path + types.Path("/"+newn.name),
+		Dics:        children,
+	}
+	ctx, h := context.WithTimeout(context.TODO(), 3*time.Second)
 	defer h()
 	return do.NsStartCtx(ctx, log)
 }
@@ -497,14 +583,14 @@ func (nsc *NameSpaceControlor) MustDeleteFile(do *wal.LogOpLet, cwd *NameSpaceTr
 			Name:  filename,
 		},
 	}
-	ctx, h := context.WithTimeout(context.TODO(), 1*time.Second)
+	ctx, h := context.WithTimeout(context.TODO(), 3*time.Second)
 	defer h()
 	return do.NsStartCtx(ctx, log)
 }
-func (nsc *NameSpaceControlor) MustCreateFile(do *wal.LogOpLet, cwd *NameSpaceTreeNode, filename string) error {
+func (nsc *NameSpaceControlor) MustCreateFile(do *wal.LogOpLet, cwd types.Path, filename string) error {
 	log := types.NsLogImpl{
-		CommandType: types.CommandCreate,
-		Path:        types.Path(cwd.name + "/" + filename),
+		CommandType: types.CommandCreate | types.OP_FILE,
+		Path:        cwd,
 		File: types.PersiteTreeNode{
 			IsDir:  false,
 			Name:   filename,
@@ -512,7 +598,7 @@ func (nsc *NameSpaceControlor) MustCreateFile(do *wal.LogOpLet, cwd *NameSpaceTr
 			Chunks: 0,
 		},
 	}
-	ctx, h := context.WithTimeout(context.TODO(), 1*time.Second)
+	ctx, h := context.WithTimeout(context.TODO(), 3*time.Second)
 	defer h()
 	return do.NsStartCtx(ctx, log)
 }

@@ -10,7 +10,7 @@ const (
 )
 
 var (
-	DefaultLogLevel = LOG_INFO
+	DefaultLogLevel = LOG_TRACE
 	// 是否启用完整日志输出
 	LogCompleteEnable = true
 )
