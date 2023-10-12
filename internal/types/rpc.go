@@ -214,3 +214,12 @@ type SnapViewArg struct {
 type SnapViewReply struct {
 	Root []NodeView
 }
+
+type PathExistArg struct {
+	Path Path
+	Dir  bool
+}
+
+type PathExistReply struct {
+	Ok bool
+}

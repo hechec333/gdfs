@@ -15,11 +15,10 @@ const (
 
 type File struct {
 	sync.RWMutex
-	c        *Client
-	p        types.Path
-	mode     int32
-	readoff  int64
-	writeoff int64
+	c    *Client
+	p    types.Path
+	mode int32
+	off  int64
 }
 
 func (f *File) Close() error {
@@ -30,7 +29,7 @@ func (f *File) Close() error {
 func (f *File) Read(p []byte) (n int, err error) {
 	f.RLock()
 	defer f.RUnlock()
-	return f.c.Read(f.p, int64(f.readoff), p)
+	return f.c.Read(f.p, int64(f.off), p)
 }
 
 func (f *File) Write(p []byte) (n int, err error) {
@@ -38,11 +37,11 @@ func (f *File) Write(p []byte) (n int, err error) {
 	defer f.RUnlock()
 	if f.mode&int32(GDFS_APONLY) == int32(GDFS_APONLY) {
 		off, err := f.c.Append(f.p, p)
-		num := off - f.writeoff
-		f.writeoff = off
+		num := off - f.off
+		f.off = off
 		return int(num), err
 	} else {
-		return f.c.Write(f.p, f.writeoff, p)
+		return f.c.Write(f.p, f.off, p)
 	}
 }
 

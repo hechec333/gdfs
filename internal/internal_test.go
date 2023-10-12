@@ -13,27 +13,31 @@ func TestM(t *testing.T) {
 
 }
 
-func TestMaster(t *testing.T) {
+func initCluseter(m []types.Addr, np []types.Addr, cks []types.Addr) {
+	for i := range m {
+		master.MustNewAndServe(&types.MetaServerServeConfig{
+			Me:       i,
+			Servers:  m,
+			Protocol: np,
+		})
+	}
+
+	for _, v := range cks {
+		chunkserver.MustNewAndServe(&types.ChunkServerServeConfig{
+			Address:     v,
+			MetaServers: m,
+			RootDir:     ".",
+		})
+	}
+}
+
+func TestCreateFile(t *testing.T) {
 
 	masters := []types.Addr{"127.0.0.1:3880", "127.0.0.1:3889"}
 	protocols := []types.Addr{"127.0.0.1:4881", "127.0.0.1:4882"}
 	chunks := []types.Addr{"127.0.0.1:4667", "127.0.0.1:4668", "127.0.0.1:4669"}
 
-	for i := range masters {
-		master.MustNewAndServe(&types.MetaServerServeConfig{
-			Me:       i,
-			Servers:  masters,
-			Protocol: protocols,
-		})
-	}
-
-	for _, v := range chunks {
-		chunkserver.MustNewAndServe(&types.ChunkServerServeConfig{
-			Address:     v,
-			MetaServers: masters,
-			RootDir:     ".",
-		})
-	}
+	initCluseter(masters, protocols, chunks)
 
 	time.Sleep(time.Second)
 	cli := client.NewClient(masters)
@@ -61,4 +65,22 @@ func TestMaster(t *testing.T) {
 	cli.Walk("/opt", func(p types.Path) {
 		t.Log(p)
 	})
+}
+
+func TestFileRW(t *testing.T) {
+	masters := []types.Addr{"127.0.0.1:3880", "127.0.0.1:3889"}
+	protocols := []types.Addr{"127.0.0.1:4881", "127.0.0.1:4882"}
+	chunks := []types.Addr{"127.0.0.1:4667", "127.0.0.1:4668", "127.0.0.1:4669"}
+
+	initCluseter(masters, protocols, chunks)
+
+	time.Sleep(time.Second)
+
+	cli := client.NewClient(masters)
+
+	err := cli.Mkdir("/opt/test", client.WithForce())
+
+	if err != nil {
+		t.Log(err)
+	}
 }

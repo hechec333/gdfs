@@ -161,7 +161,11 @@ func (c *Client) Create(path types.Path) error {
 }
 
 func (c *Client) OpenFile(path types.Path, mode int32) (*File, error) {
-
+	var (
+		f   *File
+		err error
+	)
+	return f, err
 }
 
 // Delete is a client API, deletes a file

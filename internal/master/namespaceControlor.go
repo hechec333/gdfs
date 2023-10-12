@@ -363,6 +363,26 @@ func (nsc *NameSpaceControlor) GetDeletedFile() []types.FileInfo {
 	return files
 }
 
+func (nsc *NameSpaceControlor) PathExist(path types.Path, dir bool) bool {
+	_, cwd, err := nsc.lockUpperPath(path, true)
+
+	defer nsc.unlockUpperPath(path)
+
+	if err != nil {
+		return false
+	}
+
+	cwd.RLock()
+	defer cwd.RUnlock()
+	f := common.GetFileNameWithExt(path)
+	for _, v := range cwd.children {
+		if v.isDir == dir && v.name == f {
+			return true
+		}
+	}
+	return false
+}
+
 func (nsc *NameSpaceControlor) FetchAllDeletedFiles(do *wal.LogOpLet) ([]types.FileInfo, error) {
 	files := []types.FileInfo{}
 	nsc.root.GetAllMarkedFile("", files)

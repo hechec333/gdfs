@@ -299,9 +299,30 @@ func (m *Master) serverCheck() error {
 	return nil
 }
 
+func (m *Master) CheckLeader() bool {
+	_, l := m.wal.RoleState()
+	if m.who != m.me || !l {
+		return false
+	}
+	return true
+}
+
 func (m *Master) Redirect() bool {
 	rf := m.wal.Getrf()
 	return rf.Lease.OnLease()
+}
+
+func (m *Master) WaitForLoaclRead() error {
+	spins := 0
+	for !m.wal.CheckLocalReadStat() {
+		common.LWarn("<Master%v> not in leader lease time", m.me)
+		time.Sleep(10 * time.Millisecond)
+		spins++
+		if spins >= 10 {
+			return types.ErrRedirect
+		}
+	}
+	return nil
 }
 
 func (m *Master) RPCCheckMaster(arg *types.MasterCheckArg, reply *types.MasterCheckReply) error {
@@ -353,7 +374,7 @@ func (m *Master) reReplication(handle types.ChunkHandle) error {
 // RPCHeartbeat is called by chunkserver to let the master know that a chunkserver is alive
 func (m *Master) RPCHeartbeat(args types.HeartbeatArg, reply *types.HeartbeatReply) error {
 	common.LInfo("<Master%v> heartbeat from chunkserver %v", m.me, args.Address)
-	_, is := m.wal.RoleState()
+	is := m.CheckLeader()
 	if !is {
 		reply.Redirect = true
 		return nil
@@ -433,11 +454,12 @@ func (m *Master) RPCGetPrimaryAndSecondaries(args types.GetPrimaryAndSecondaries
 
 // RPCGetReplicas is called by client to find all chunkserver that holds the chunk.
 func (m *Master) RPCGetReplicas(args types.GetReplicasArg, reply *types.GetReplicasReply) error {
-	if !m.wal.CheckLocalReadStat() {
-		m.RLock()
-		who := m.masterAddrs[m.who]
-		m.RUnlock()
-		return xrpc.Call(who, "Master.RPCGetReplicas", args, reply)
+	if !m.CheckLeader() {
+		return types.ErrRedirect
+	}
+	err := m.WaitForLoaclRead()
+	if err != nil {
+		return err
 	}
 	servers, err := m.cc.GetReplicas(args.Handle)
 	if err != nil {
@@ -457,7 +479,7 @@ func (m *Master) RPCCreateFile(args types.CreateFileArg, reply *types.CreateFile
 			err = errz.(error)
 		}
 	}()
-	if _, l := m.wal.RoleState(); m.who != m.me || !l {
+	if !m.CheckLeader() {
 		return types.ErrRedirect
 	}
 	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
@@ -471,7 +493,7 @@ func (m *Master) RPCDeleteFile(args types.DeleteFileArg, reply *types.DeleteFile
 			err = errz.(error)
 		}
 	}()
-	if _, l := m.wal.RoleState(); m.who != m.me || !l {
+	if !m.CheckLeader() {
 		return types.ErrRedirect
 	}
 	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
@@ -492,7 +514,7 @@ func (m *Master) RPCMkdir(args types.MkdirArg, reply *types.MkdirReply) (err err
 			err = errz.(error)
 		}
 	}()
-	if _, l := m.wal.RoleState(); m.who != m.me || !l {
+	if !m.CheckLeader() {
 		return types.ErrRedirect
 	}
 
@@ -503,24 +525,25 @@ func (m *Master) RPCMkdir(args types.MkdirArg, reply *types.MkdirReply) (err err
 
 // RPCList is called by client to list all files in specific directory
 func (m *Master) RPCList(args types.ListArg, reply *types.ListReply) error {
-	if !m.wal.CheckLocalReadStat() {
-		m.RLock()
-		who := m.masterAddrs[m.who]
-		m.RUnlock()
-		return xrpc.Call(who, "Master.RPCList", args, reply)
+	if !m.CheckLeader() {
+		return types.ErrRedirect
 	}
-	var err error
+	err := m.WaitForLoaclRead()
+	if err != nil {
+		return err
+	}
 	reply.Files, err = m.ns.GetList(args.Path)
 	return err
 }
 
 // RPCGetFileInfo is called by client to get file information
 func (m *Master) RPCGetFileInfo(args types.GetFileInfoArg, reply *types.GetFileInfoReply) error {
-	if !m.wal.CheckLocalReadStat() {
-		m.RLock()
-		who := m.masterAddrs[m.who]
-		m.RUnlock()
-		return xrpc.Call(who, "Master.RPCGetFileInfo", args, reply)
+	if !m.CheckLeader() {
+		return types.ErrRedirect
+	}
+	err := m.WaitForLoaclRead()
+	if err != nil {
+		return err
 	}
 	info, err := m.ns.GetFileInfoImpl(args.Path)
 	if info.IsDir {
@@ -584,18 +607,27 @@ func (m *Master) RPCGetChunkHandle(args types.GetChunkHandleArg, reply *types.Ge
 	return
 }
 
-func (m *Master) RPCSnapView(arg types.SnapViewArg, argv *types.SnapViewReply) error {
-	if _, l := m.wal.RoleState(); m.who != m.me || !l {
+func (m *Master) RPCPathExist(arg types.PathExistArg, reply *types.PathExistReply) error {
+	if !m.CheckLeader() {
 		return types.ErrRedirect
 	}
-	spins := 0
-	for !m.wal.CheckLocalReadStat() {
-		common.LWarn("<Master%v> not in leader lease time", m.me)
-		time.Sleep(10 * time.Millisecond)
-		spins++
-		if spins >= 10 {
-			return types.ErrRedirect
-		}
+	err := m.WaitForLoaclRead()
+	if err != nil {
+		return err
+	}
+
+	reply.Ok = m.ns.PathExist(arg.Path, arg.Dir)
+
+	return nil
+}
+
+func (m *Master) RPCSnapView(arg types.SnapViewArg, argv *types.SnapViewReply) error {
+	if !m.CheckLeader() {
+		return types.ErrRedirect
+	}
+	err := m.WaitForLoaclRead()
+	if err != nil {
+		return err
 	}
 	// 获取指定结点的视图
 	tree, err := m.ns.NodeScan(arg.Path, nil)
