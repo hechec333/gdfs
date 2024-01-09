@@ -2,7 +2,7 @@ package mr
 
 import (
 	"fmt"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"log"
 	"net"
 	"net/rpc"
@@ -434,7 +434,7 @@ func MakeCoordinator(files []string, l net.Listener, m MasterSetupArg) *Coordina
 }
 
 func reportCheck(arg CheckArg) {
-	
+
 }
 
 func MasterEntrypoint(m MasterSetupArg) {

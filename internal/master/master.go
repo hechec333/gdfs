@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"gdfs/internal/common"
 	xrpc "gdfs/internal/common/rpc"
-	"gdfs/internal/types"
 	"gdfs/internal/wal"
 	"gdfs/internal/wal/raft"
+	"gdfs/types"
 	"log"
 	"net"
 	"net/rpc"
@@ -57,17 +57,70 @@ func (m *Master) chunkDispath(log types.ChunkLogImpl) error {
 		return types.ErrUnknownOperation
 	}
 }
+func (m *Master) opDispatch(log types.BatchLogImpl) error {
+	switch log.Type {
+	case types.NsLog:
+		ins := make([]types.NsLogImpl, len(log.Batch))
+
+		for idx, v := range log.Batch {
+			ins[idx] = v.(types.NsLogImpl)
+		}
+		return m.batchDispatch(ins)
+	case types.ChunkLog:
+		fallthrough
+	default:
+		return types.ErrUnknownOperation
+	}
+}
+
+func (m *Master) batchDispatch(ins []types.NsLogImpl) error {
+	tpo := ins[0].CommandType
+
+	switch tpo & 0xffff {
+	case types.CommandCreate:
+		pp := ins[0].Path
+		if tpo&types.OP_FILE == types.OP_FILE {
+			coms := make([]types.PersiteTreeNode, len(ins))
+			for idx, v := range ins {
+				coms[idx] = v.File
+			}
+			return m.ns.applyCreatef(pp, coms)
+		}
+
+		if tpo&types.OP_DIC == types.OP_DIC {
+			coms := make([][]types.PersiteTreeNode, len(ins))
+
+			for idx, v := range ins {
+				coms[idx] = v.Dics
+			}
+
+			return m.ns.applyBatchMkdir(pp, coms)
+		}
+
+		return types.ErrUnReachAble
+	case types.CommandDelete:
+		pp := ins[0].Path
+		coms := make([]types.PersiteTreeNode, len(ins))
+		for idx, v := range ins {
+			coms[idx] = v.File
+		}
+		return m.ns.applyDelete(pp, coms)
+	}
+
+	return types.ErrInvalidArgument
+}
+
 func (m *Master) nsDispatch(log types.NsLogImpl) error {
 	switch log.CommandType & 0xffff {
 	case types.CommandCreate:
 		if log.CommandType&types.OP_FILE == types.OP_FILE {
-			return m.ns.applyCreatef(log.Path, log.File)
+			return m.ns.applyCreatef(log.Path, []types.PersiteTreeNode{log.File})
 		}
 		if log.CommandType&types.OP_DIC == types.OP_DIC {
 			return m.ns.applyCreated(log.Path, log.Dics)
 		}
 	case types.CommandDelete:
-		return m.ns.applyDelete(log.Path, log.File)
+		return m.ns.applyDelete(log.Path, []types.PersiteTreeNode{log.File})
 	case types.CommandUpdate:
 		return m.ns.applyChangeFileInfo(log.Path, log.File)
 	default:
@@ -81,6 +134,8 @@ func (m *Master) dispatch(log *wal.LogOp) error {
 		return m.chunkDispath(log.Log.(types.ChunkLogImpl))
 	} else if log.OpType == types.NsLog {
 		return m.nsDispatch(log.Log.(types.NsLogImpl))
+	} else if log.OpType == types.BatchLog {
+		return m.opDispatch(log.Log.(types.BatchLogImpl))
 	} else {
 		return types.ErrUnknownLog
 	}
@@ -318,7 +373,7 @@ func (m *Master) WaitForLoaclRead() error {
 		common.LWarn("<Master%v> not in leader lease time", m.me)
 		time.Sleep(10 * time.Millisecond)
 		spins++
-		if spins >= 10 {
+		if spins >= 5 {
 			return types.ErrRedirect
 		}
 	}
@@ -401,7 +456,6 @@ func (m *Master) RPCHeartbeat(args types.HeartbeatArg, reply *types.HeartbeatRep
 			m.cc.RUnlock()
 
 			if v.Version == version {
-				//log.Infof("Master receive chunk %v from %v", v.Handle, args.Address)
 				common.LTrace("<Master%v> commit chunk %v from ck %v", m.me, v.ChunkHandle, args.Address)
 				m.cc.RegisterReplicas(v.ChunkHandle, args.Address)
 				m.csc.AddChunk([]types.Addr{args.Address}, v.ChunkHandle)
@@ -409,6 +463,8 @@ func (m *Master) RPCHeartbeat(args types.HeartbeatArg, reply *types.HeartbeatRep
 				common.LTrace("<Master%v> discard chunk %v,inequal version set", m.me, v.ChunkHandle)
 			}
 		}
+		// 更新master的property
+		m.csc.UpdateServerProperty(args.Address, r.Pro)
 	}
 	return nil
 }
@@ -417,10 +473,10 @@ func (m *Master) RPCHeartbeat(args types.HeartbeatArg, reply *types.HeartbeatRep
 // If no one holds the lease currently, grant one.
 // Master will communicate with all replicas holder to check version, if stale replica is detected, add it to garbage collection
 func (m *Master) RPCGetPrimaryAndSecondaries(args types.GetPrimaryAndSecondariesArg, reply *types.GetPrimaryAndSecondariesReply) error {
-	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
+	let := wal.NewLogOpLet(m.wal, args.ClientIdentity.ClientId, args.ClientIdentity.Seq, "client")
 	defer func() {
 		if err := recover(); err != nil {
-			reply.Err = err.(error)
+			reply.Err = types.NewError(err.(error))
 		}
 	}()
 
@@ -433,12 +489,18 @@ func (m *Master) RPCGetPrimaryAndSecondaries(args types.GetPrimaryAndSecondaries
 		m.csc.AddGarbage(v, args.Handle)
 	}
 
-	reply.Primary = lease.Primary
+	reply.Primary = types.EndpointInfo{
+		Addr:     lease.Primary,
+		Property: m.csc.GetServerProperty(lease.Primary),
+	}
 	reply.Expire = lease.Expire
 
 	for _, v := range lease.Location {
 		if v != lease.Primary {
-			reply.Secondaries = append(reply.Secondaries, v)
+			reply.Secondaries = append(reply.Secondaries, types.EndpointInfo{
+				Addr:     v,
+				Property: m.csc.GetServerProperty(v),
+			})
 		}
 	}
 	return nil
@@ -465,7 +527,12 @@ func (m *Master) RPCGetReplicas(args types.GetReplicasArg, reply *types.GetRepli
 	if err != nil {
 		return err
 	}
-	reply.Locations = append(reply.Locations, servers...)
+	for _, server := range servers {
+		reply.Locations = append(reply.Locations, types.EndpointInfo{
+			Addr:     server,
+			Property: m.csc.GetServerProperty(server),
+		})
+	}
 	// for _, v := range servers {
 	// 	reply.Locations = append(reply.Locations, v)
 	// }
@@ -482,8 +549,8 @@ func (m *Master) RPCCreateFile(args types.CreateFileArg, reply *types.CreateFile
 	if !m.CheckLeader() {
 		return types.ErrRedirect
 	}
-	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
-	return m.ns.CreateFileImpl(let, args.Path)
+	let := wal.NewLogOpLet(m.wal, args.ClientIdentity.ClientId, args.ClientIdentity.Seq, "client")
+	return m.ns.CreateFileImpl(let, args.Path, args.Perm)
 }
 
 // RPCDelete is called by client to delete a file
@@ -496,8 +563,8 @@ func (m *Master) RPCDeleteFile(args types.DeleteFileArg, reply *types.DeleteFile
 	if !m.CheckLeader() {
 		return types.ErrRedirect
 	}
-	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
-	reply.Err = m.ns.DeleteFileImpl(let, args.Path)
+	let := wal.NewLogOpLet(m.wal, args.ClientIdentity.ClientId, args.ClientIdentity.Seq, "client")
+	reply.Err = types.NewError(m.ns.DeleteFileImpl(let, args.Path))
 	return
 }
 
@@ -518,7 +585,7 @@ func (m *Master) RPCMkdir(args types.MkdirArg, reply *types.MkdirReply) (err err
 		return types.ErrRedirect
 	}
 
-	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
+	let := wal.NewLogOpLet(m.wal, args.ClientIdentity.ClientId, args.ClientIdentity.Seq, "client")
 	err = m.ns.MkdirImpl(let, args.Path, args.Cfg.Recursive)
 	return
 }
@@ -554,13 +621,98 @@ func (m *Master) RPCGetFileInfo(args types.GetFileInfoArg, reply *types.GetFileI
 	return err
 }
 
+func (m *Master) RPCSetFilePerm(arg types.SetFilePermArg, reply *types.SetFilePermReply) (err error) {
+	defer func() {
+		if errz := recover(); errz != nil {
+			err = errz.(error)
+		}
+	}()
+	if !m.CheckLeader() {
+		return types.ErrRedirect
+	}
+
+	let := wal.NewLogOpLet(m.wal, arg.ClientIdentity.ClientId, arg.ClientIdentity.Seq, "client")
+
+	return m.ns.SetFilePerm(let, arg.Path, arg.Perm)
+}
+
+func (m *Master) RPCGetFilePerm(arg types.GetFilePermArg, reply *types.GetFilePermReply) error {
+	if !m.CheckLeader() {
+		return types.ErrRedirect
+	}
+	err := m.WaitForLoaclRead()
+	if err != nil {
+		return err
+	}
+
+	info, err := m.ns.GetFilePerm(arg.Path)
+
+	if err != nil {
+		return err
+	}
+
+	reply.Info = info
+
+	return nil
+}
+
+func (m *Master) RPCGetFileDetail(arg *types.GetFileDetailArg, argv *types.GetFileDetailReply) error {
+	if !m.CheckLeader() {
+		return types.ErrRedirect
+	}
+	err := m.WaitForLoaclRead()
+	if err != nil {
+		return err
+	}
+
+	info, err := m.ns.GetFileInfoImpl(arg.Path)
+
+	if err != nil {
+		return err
+	}
+
+	argv.Length = info.Length
+
+	max := info.Chunks
+
+	// m.cc.RLock()
+	// defer m.cc.RUnlock()
+	handles := make([]types.ChunkHandle, max)
+
+	for i := 0; i < int(max); i++ {
+		handles[i], err = m.cc.GetChunk(arg.Path, i)
+		if err != nil {
+			return err
+		}
+
+		ck := m.cc.Chunk[handles[i]]
+		backups := make([]types.Addr, 0)
+		for x := 0; x < len(ck.Replicas); x++ {
+			if ck.Replicas[i] != ck.Primary {
+				backups = append(backups, ck.Replicas[i])
+			}
+		}
+		argv.Chunks = append(argv.Chunks, types.ChunkDetail{
+			Handle: handles[i],
+			Lease: types.LeaseInfo{
+				Primary: ck.Primary,
+				Backups: backups,
+				Exipre:  ck.Expire,
+			},
+			Version: int64(ck.Version),
+		})
+	}
+
+	return nil
+}
+
 // RPCGetChunkHandle returns the chunk handle of (path, index).
 // If the requested index is bigger than the number of chunks of this path by one, create one.
 func (m *Master) RPCGetChunkHandle(args types.GetChunkHandleArg, reply *types.GetChunkHandleReply) (err error) {
 	_, cwd, err := m.ns.lockUpperPath(args.Path, true)
 	defer m.ns.unlockUpperPath(args.Path)
 	if err != nil {
-		reply.Err = err
+		reply.Err = types.NewError(err)
 		return
 	}
 	cwd.RLock()
@@ -568,15 +720,17 @@ func (m *Master) RPCGetChunkHandle(args types.GetChunkHandleArg, reply *types.Ge
 	file, ok := cwd.GetChild(common.GetFileNameWithExt(args.Path))
 	// append new chunks
 	if !ok {
-		reply.Err = os.ErrNotExist
+		reply.Err = types.NewError(os.ErrNotExist)
 	}
 	file.Lock()
 	defer file.Unlock()
-	let := wal.NewLogOpLet(m.wal, args.ClientId, args.Seq, "client")
+	let := wal.NewLogOpLet(m.wal, args.ClientIdentity.ClientId, args.ClientIdentity.Seq, "client")
 	if int(args.Index) == int(file.chunks) { //如果不够就创建,惰性策略的一种体现
 		defer func() {
 			errz := recover()
-			err = errz.(error)
+			if errz != nil {
+				err = errz.(error)
+			}
 		}()
 		//file.chunks++
 		errz := file.MustAddChunks(let, args.Path, 1)
@@ -586,15 +740,16 @@ func (m *Master) RPCGetChunkHandle(args types.GetChunkHandleArg, reply *types.Ge
 		//
 		addrs, errz := m.csc.ScheduleActiveServers(common.ReplicasLevel)
 		if err != nil && len(addrs) == 0 {
-			reply.Err = errz
+			reply.Err = types.NewError(errz)
 			return
 		}
+		num := len(addrs)
 		var errs []error
 		reply.Handle, addrs, errs = m.cc.CreateChunk(let, args.Path, addrs)
-		if len(errs) == len(addrs) {
+		if len(errs) == num {
 			// WARNING
 			//log.Warning("[ignored] An ignored error in RPCGetChunkHandle when create ", err, " in create chunk ", reply.Handle)
-			reply.Err = common.JoinErrors(errs...)
+			reply.Err = types.NewError(common.JoinErrors(errs...))
 			common.LWarn("<Master%v> Create Chunk to %v errors %v", m.me, addrs, reply.Err)
 			return
 		}
@@ -607,7 +762,7 @@ func (m *Master) RPCGetChunkHandle(args types.GetChunkHandleArg, reply *types.Ge
 	return
 }
 
-func (m *Master) RPCPathExist(arg types.PathExistArg, reply *types.PathExistReply) error {
+func (m *Master) RPCPathTest(arg types.PathExistArg, reply *types.PathExistReply) error {
 	if !m.CheckLeader() {
 		return types.ErrRedirect
 	}
@@ -616,9 +771,102 @@ func (m *Master) RPCPathExist(arg types.PathExistArg, reply *types.PathExistRepl
 		return err
 	}
 
-	reply.Ok = m.ns.PathExist(arg.Path, arg.Dir)
+	reply.Ok, err = m.ns.PathTest(arg.Path)
+
+	return err
+}
+
+func (m *Master) RPCPathExist(arg types.PathExistArg, reply *types.PathExistReply) (err error) {
+	if !m.CheckLeader() {
+		return types.ErrRedirect
+	}
+	err = m.WaitForLoaclRead()
+	if err != nil {
+		return err
+	}
+
+	reply.Ok, err = m.ns.PathExist(arg.Path, arg.Dir)
 
 	return nil
+}
+
+func supportMethod(service string) error {
+	switch service {
+	case "touch":
+		fallthrough
+	case "mkdir":
+		fallthrough
+	case "rm":
+		return nil
+	default:
+		return types.ErrInvalidArgument
+	}
+}
+
+var BatchOpMap map[string]func(*BatchContext) error = make(map[string]func(*BatchContext) error)
+
+func (m *Master) BatchOpInit() {
+	BatchOpMap["touch"] = func(bc *BatchContext) error {
+		args := make([]types.CreateFileArg, len(bc.Arg.Cmd))
+		paths := make([]types.Path, len(bc.Arg.Cmd))
+		for idx, v := range bc.Arg.Cmd {
+			args[idx] = v.(types.CreateFileArg)
+			paths[idx] = args[idx].Path
+		}
+		return m.ns.CreateBatchFileImpl(bc.Do, args[0].Perm, paths...)
+	}
+
+	BatchOpMap["mkdir"] = func(bc *BatchContext) error {
+		paths := make([]types.Path, len(bc.Arg.Cmd))
+		for idx, v := range bc.Arg.Cmd {
+			paths[idx] = v.(types.CreateFileArg).Path
+		}
+		return m.ns.CreateBatchDicImpl(bc.Do, paths...)
+	}
+
+	BatchOpMap["rm"] = func(bc *BatchContext) error {
+		paths := make([]types.Path, len(bc.Arg.Cmd))
+		for idx, v := range bc.Arg.Cmd {
+			paths[idx] = v.(types.CreateFileArg).Path
+		}
+		return m.ns.DeleteBatchFileImpl(bc.Do, paths...)
+	}
+}
+
+type BatchContext struct {
+	Do    *wal.LogOpLet
+	Arg   types.BatchOpArg
+	Reply *types.BatchOpReply
+}
+
+// 暂未支持
+func (m *Master) RPCBatchOp(args *types.BatchOpArg, reply *types.BatchOpReply) (err error) {
+
+	defer func() {
+		if errz := recover(); errz != nil {
+			err = errz.(error)
+		}
+	}()
+	if !m.CheckLeader() {
+		return types.ErrRedirect
+	}
+
+	let := wal.NewLogOpLet(m.wal, args.ClientIdentity.ClientId, args.ClientIdentity.Seq, "client")
+
+	bc := BatchContext{
+		Do:    let,
+		Arg:   *args,
+		Reply: reply,
+	}
+
+	if f, ok := BatchOpMap[args.Method]; ok {
+		xerr := f(&bc)
+		reply.Err = types.NewError(xerr)
+	} else {
+		err = types.ErrInvalidArgument
+	}
+
+	return
 }
 
 func (m *Master) RPCSnapView(arg types.SnapViewArg, argv *types.SnapViewReply) error {

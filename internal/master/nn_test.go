@@ -1,7 +1,7 @@
 package master
 
 import (
-	"gdfs/internal/types"
+	"gdfs/types"
 	"path"
 	"testing"
 )
@@ -22,9 +22,11 @@ func TestNnDfs(t *testing.T) {
 	}
 	for _, v := range files {
 		_, f := path.Split(v)
-		nsc.applyCreatef(types.Path(v), types.PersiteTreeNode{
-			Name:  f,
-			IsDir: true,
+		nsc.applyCreatef(types.Path(v), []types.PersiteTreeNode{
+			{
+				Name:  f,
+				IsDir: true,
+			},
 		})
 	}
 	nsc.root.bfs("", func(path types.Path, n *NameSpaceTreeNode) {

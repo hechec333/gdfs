@@ -12,6 +12,7 @@ type ChunkServerServeConfig struct {
 	Address     Addr
 	MetaServers []Addr
 	RootDir     Path
+	Pro         map[string]interface{}
 }
 
 type MetaServerServeConfig struct {
@@ -31,6 +32,7 @@ type FileInfo struct {
 	Path   Path
 	Chunks int64
 	Length int64
+	Mode   PermInfo
 }
 
 type NodeView struct {
@@ -39,6 +41,10 @@ type NodeView struct {
 	Chunks  int64
 	Length  int64
 	Handles []ChunkHandle
+}
+
+type ServerProperty struct {
+	Property map[string]interface{}
 }
 
 type LeaseInfo struct {
@@ -54,12 +60,20 @@ type PersiteFileInfo struct {
 type PersiteChunkControlor struct {
 	Files []PersiteFileInfo
 }
+
+type PermInfo struct {
+	Perm         FilePerm
+	LastModefied time.Time
+	CreateTime   time.Time
+}
+
 type PersiteTreeNode struct {
 	IsDir    bool
 	Name     string
 	Children []int
 	Length   int64
 	Chunks   int64
+	Mode     PermInfo
 }
 type PersiteChunkInfo struct {
 	Version     int
@@ -72,6 +86,20 @@ type DataBufferID struct {
 	Handle    ChunkHandle
 	TimeStamp int
 }
+
+var PermMap = map[FilePerm]string{
+	PermReadWrite: "+rw",
+	PermReadOnly:  "+ro",
+	PermExcute:    "+rx",
+}
+
+type FilePerm uint8
+
+const (
+	PermReadWrite = iota
+	PermReadOnly
+	PermExcute
+)
 
 type MutationType int
 

@@ -2,19 +2,19 @@ package fs
 
 import (
 	"context"
-	"gdfs/internal/types"
-	"gdfs/toolkit/cli"
+	"gdfs/toolkit/cli/cmd"
+	"gdfs/types"
 	"io"
 )
 
 // gdfsctl descirbe ${file}
 
-func describe(cli *cli.CliContext, path types.Path, w io.Writer) error {
+func Describe(cli *cmd.CliContext, path types.Path, w io.Writer) error {
 
 	return nil
 }
 
-func getDetail(cli *cli.CliContext, path types.Path) (types.GetFileDetailReply, error) {
+func getDetail(cli *cmd.CliContext, path types.Path) (types.GetFileDetailReply, error) {
 
 	ctx := context.Background()
 	arg := types.GetFileDetailArg{

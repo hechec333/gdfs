@@ -5,7 +5,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"gdfs/internal/common"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"os"
 	"sync"
 	"time"

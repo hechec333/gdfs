@@ -2,10 +2,9 @@ package master
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"gdfs/internal/common"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"gdfs/internal/wal"
 	"log"
 	"path"
@@ -14,7 +13,11 @@ import (
 	"time"
 )
 
-var ErrPathNotFound error = errors.New("Path Not Found")
+type FileMode struct {
+	perm         types.FilePerm
+	lastModefied time.Time
+	createTime   time.Time
+}
 
 type NameSpaceControlor struct {
 	root *NameSpaceTreeNode
@@ -29,6 +32,18 @@ type NameSpaceTreeNode struct {
 	// file property
 	length int64
 	chunks int64
+
+	mode *FileMode
+}
+
+func (nst *NameSpaceTreeNode) isExist(name string) bool {
+	for _, v := range nst.children {
+		if v.name == name {
+			return true
+		}
+	}
+
+	return false
 }
 
 func NewNsTree(root types.Path) *NameSpaceTreeNode {
@@ -75,7 +90,7 @@ func (nsc *NameSpaceControlor) lockUpperPath(path types.Path, lock bool) ([]stri
 	}
 
 	if len(parent) != depth {
-		return parent[:depth], root, ErrPathNotFound
+		return parent[:depth], root, types.ErrPathNotFound
 	}
 	// if lock {
 	// 	//root.RLock()
@@ -112,7 +127,7 @@ func (nsc *NameSpaceControlor) unlockUpperPath(path types.Path) {
 	}
 }
 
-func (nsc *NameSpaceControlor) CreateFileImpl(do *wal.LogOpLet, path types.Path) error {
+func (nsc *NameSpaceControlor) CreateFileImpl(do *wal.LogOpLet, path types.Path, perm types.FilePerm) error {
 	_, cwd, err := nsc.lockUpperPath(path, true)
 	defer nsc.unlockUpperPath(path)
 	if err != nil {
@@ -128,10 +143,100 @@ func (nsc *NameSpaceControlor) CreateFileImpl(do *wal.LogOpLet, path types.Path)
 	// 	chunks: 0,
 	// 	length: 0,
 	// })
-	err = nsc.MustCreateFile(do, path, common.GetFileNameWithExt(path))
+	err = nsc.MustCreateFile(do, path, common.GetFileNameWithExt(path), perm)
 	if err != nil {
 		panic(err)
 	}
+	return nil
+}
+
+func extractCommonPath(paths []types.Path) (string, []string, error) {
+	if len(paths) < 1 {
+		return "", nil, types.ErrInvalidArgument
+	}
+
+	prefix, _ := common.PartionPath(paths[0])
+
+	commonprefix := path.Join(prefix...)
+
+	names := make([]string, len(paths))
+
+	for i := 0; i < len(paths); i++ {
+		str := strings.TrimPrefix(string(paths[i]), commonprefix)
+		// 所有path必须同一个父路径
+		if str == string(paths[i]) {
+			return "", nil, types.ErrInvalidArgument
+		}
+
+		names[i] = str
+	}
+
+	return commonprefix, names, nil
+}
+
+func (nsc *NameSpaceControlor) CreateBatchFileImpl(do *wal.LogOpLet, perm types.FilePerm, paths ...types.Path) error {
+
+	commonprefix, names, err := extractCommonPath(paths)
+	if err != nil {
+		return err
+	}
+	_, _, err = nsc.lockUpperPath(types.Path(commonprefix+"/x"), true)
+
+	if err != nil {
+		return err
+	}
+
+	defer nsc.unlockUpperPath(types.Path(commonprefix + "/x"))
+
+	err = nsc.MustCreateBatchFile(do, types.Path(commonprefix+"/x"), perm, names)
+
+	if err != nil {
+		panic(err)
+	}
+
+	return nil
+}
+
+func (nsc *NameSpaceControlor) CreateBatchDicImpl(do *wal.LogOpLet, paths ...types.Path) error {
+	commonprefix, names, err := extractCommonPath(paths)
+	if err != nil {
+		return err
+	}
+
+	_, _, err = nsc.lockUpperPath(types.Path(commonprefix+"/x"), true)
+
+	if err != nil {
+		return err
+	}
+	defer nsc.unlockUpperPath(types.Path(commonprefix + "/x"))
+
+	err = nsc.MustBatchMkdir(do, types.Path(commonprefix+"/x"), names)
+
+	if err != nil {
+		panic(err)
+	}
+
+	return nil
+}
+
+func (nsc *NameSpaceControlor) DeleteBatchFileImpl(do *wal.LogOpLet, paths ...types.Path) error {
+	commonprefix, names, err := extractCommonPath(paths)
+	if err != nil {
+		return err
+	}
+	_, _, err = nsc.lockUpperPath(types.Path(commonprefix+"/x"), true)
+
+	if err != nil {
+		return err
+	}
+	defer nsc.unlockUpperPath(types.Path(commonprefix + "/x"))
+
+	err = nsc.MustDeleteBatchFile(do, types.Path(commonprefix+"/x"), names)
+
+	if err != nil {
+		panic(err)
+	}
+
 	return nil
 }
 
@@ -155,17 +260,18 @@ func (nsc *NameSpaceControlor) DeleteFileImpl(do *wal.LogOpLet, xpath types.Path
 	// 		break
 	// 	}
 	// }
-	err = nsc.MustDeleteFile(do, cwd, filename)
+	err = nsc.MustDeleteFile(do, xpath, filename)
 	if err != nil {
 		panic(err)
 	}
 	return nil
 }
 
-func (nsc *NameSpaceControlor) MkdirImpl(do *wal.LogOpLet, path types.Path, r bool) error {
+func (nsc *NameSpaceControlor) RecursiveMkdirImpl(do *wal.LogOpLet, path types.Path) error {
+
 	p, cwd, err := nsc.lockUpperPath(path, true)
 	if err != nil {
-		if err == ErrPathNotFound && r {
+		if err == types.ErrPathNotFound {
 			var (
 				idx int
 			)
@@ -193,13 +299,21 @@ func (nsc *NameSpaceControlor) MkdirImpl(do *wal.LogOpLet, path types.Path, r bo
 			}
 			defer cwd.Unlock()
 			var xpt string = strings.Join(xps[:idx], "/")
-			// if idx == 1 {
-			// 	xpt = "/"
-			// } else {
-			// 	xpt = strings.Join(xps[:idx], "/")
-			// }
+
 			err = nsc.MustMkdir(do, types.Path(xpt), xr)
 		}
+		return err
+	} else {
+		return types.ErrUnReachAble
+	}
+}
+
+func (nsc *NameSpaceControlor) MkdirImpl(do *wal.LogOpLet, path types.Path, r bool) error {
+	if r {
+		return nsc.RecursiveMkdirImpl(do, path)
+	}
+	_, cwd, err := nsc.lockUpperPath(path, true)
+	if err != nil {
 		return err
 	}
 	defer nsc.unlockUpperPath(path)
@@ -208,9 +322,13 @@ func (nsc *NameSpaceControlor) MkdirImpl(do *wal.LogOpLet, path types.Path, r bo
 	defer cwd.Unlock()
 	filename := common.GetFileNameWithExt(path)
 
+	idx := strings.LastIndex(string(path), "/")
+	path = path[:idx]
+
 	err = nsc.MustMkdir(do, path, &NameSpaceTreeNode{
-		name:  filename,
-		isDir: true,
+		name:     filename,
+		isDir:    true,
+		children: []*NameSpaceTreeNode{},
 	})
 	if err != nil {
 		panic(err)
@@ -224,12 +342,12 @@ func (nsc *NameSpaceControlor) MkdirImpl(do *wal.LogOpLet, path types.Path, r bo
 
 func (nsc *NameSpaceControlor) GetList(path types.Path) ([]types.PathInfo, error) {
 	_, cwd, err := nsc.lockUpperPath(path, true)
-	defer nsc.unlockUpperPath(path)
 	list := []types.PathInfo{}
-
+	defer nsc.unlockUpperPath(path)
 	if err != nil {
 		return list, err
 	}
+
 	cwd.RLock()
 	defer cwd.RUnlock()
 	// todo Distinguish Root problem
@@ -275,6 +393,8 @@ func (nsc *NameSpaceControlor) getRootList() (res []types.PathInfo) {
 func (nsc *NameSpaceControlor) GetChildrenInfoImpl(path types.Path) ([]types.FileInfo, error) {
 	_, cwd, err := nsc.lockUpperPath(path, true)
 	childs := []types.FileInfo{}
+
+	defer nsc.unlockUpperPath(path)
 	if err != nil {
 		return childs, err
 	}
@@ -296,10 +416,48 @@ func (nsc *NameSpaceControlor) GetChildrenInfoImpl(path types.Path) ([]types.Fil
 				Path:   path + "/" + types.Path(v.name),
 				Chunks: v.chunks,
 				Length: v.length,
+				Mode: types.PermInfo{
+					Perm:         v.mode.perm,
+					LastModefied: v.mode.lastModefied,
+					CreateTime:   v.mode.createTime,
+				},
 			})
 		}
 	}
 	return childs, nil
+}
+
+func (nsc *NameSpaceControlor) GetFilePerm(path types.Path) (types.FileInfo, error) {
+	_, cwd, err := nsc.lockUpperPath(path, true)
+	info := types.FileInfo{}
+	defer nsc.unlockUpperPath(path)
+	if err != nil {
+		return info, err
+	}
+
+	name := common.GetFileNameWithExt(path)
+
+	for _, v := range cwd.children {
+		if v.IsMark() {
+			continue
+		}
+
+		if name == v.name && !v.isDir {
+			info.Chunks = v.chunks
+			info.Path = path
+			info.Length = v.length
+			info.Mode = types.PermInfo{
+				Perm:         v.mode.perm,
+				LastModefied: v.mode.lastModefied,
+				CreateTime:   v.mode.createTime,
+			}
+
+			return info, nil
+		}
+
+	}
+
+	return info, types.ErrPathNotFound
 }
 
 func (nsc *NameSpaceControlor) GetFileInfoImpl(path types.Path) (types.PathInfo, error) {
@@ -348,6 +506,11 @@ func (nsc *NameSpaceControlor) NodeScan(root types.Path, f func(path types.Path)
 			IsDir:  n.isDir,
 			Length: n.length,
 			Chunks: n.chunks,
+			Mode: types.PermInfo{
+				Perm:         n.mode.perm,
+				LastModefied: n.mode.lastModefied,
+				CreateTime:   n.mode.createTime,
+			},
 		})
 		if f != nil {
 			f(path)
@@ -363,13 +526,35 @@ func (nsc *NameSpaceControlor) GetDeletedFile() []types.FileInfo {
 	return files
 }
 
-func (nsc *NameSpaceControlor) PathExist(path types.Path, dir bool) bool {
+func (nsc *NameSpaceControlor) PathTest(path types.Path) (bool, error) {
 	_, cwd, err := nsc.lockUpperPath(path, true)
 
 	defer nsc.unlockUpperPath(path)
 
 	if err != nil {
-		return false
+		return false, err
+	}
+
+	cwd.RLock()
+	defer cwd.RUnlock()
+	f := common.GetFileNameWithExt(path)
+
+	for _, v := range cwd.children {
+		if v.name == f {
+			return v.isDir, nil
+		}
+	}
+
+	return false, types.ErrPathNotFound
+}
+
+func (nsc *NameSpaceControlor) PathExist(path types.Path, dir bool) (bool, error) {
+	_, cwd, err := nsc.lockUpperPath(path, true)
+
+	defer nsc.unlockUpperPath(path)
+
+	if err != nil {
+		return false, err
 	}
 
 	cwd.RLock()
@@ -377,10 +562,10 @@ func (nsc *NameSpaceControlor) PathExist(path types.Path, dir bool) bool {
 	f := common.GetFileNameWithExt(path)
 	for _, v := range cwd.children {
 		if v.isDir == dir && v.name == f {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func (nsc *NameSpaceControlor) FetchAllDeletedFiles(do *wal.LogOpLet) ([]types.FileInfo, error) {
@@ -427,6 +612,28 @@ func (nst *NameSpaceTreeNode) GetAllMarkedFile(path types.Path, files []types.Fi
 	}
 }
 
+func (nsc *NameSpaceControlor) SetFilePerm(do *wal.LogOpLet, path types.Path, perm types.FilePerm) error {
+	_, cwd, err := nsc.lockUpperPath(path, true)
+
+	defer nsc.unlockUpperPath(path)
+
+	if err != nil {
+		return err
+	}
+
+	cwd.RLock()
+	defer cwd.RUnlock()
+	f := common.GetFileNameWithExt(path)
+	//var st *NameSpaceTreeNode
+	for _, v := range cwd.children {
+		if !v.isDir && !v.IsMark() && v.name == f {
+			return v.MustUpdatePerm(do, path, perm)
+		}
+	}
+
+	return types.ErrPathNotFound
+}
+
 // only mark file
 func (nst *NameSpaceTreeNode) MarkDeleted() {
 	if nst.isDir {
@@ -454,6 +661,15 @@ func (nst *NameSpaceTreeNode) Serial(array *[]types.PersiteTreeNode) int {
 		Length:   nst.length,
 		Children: make([]int, 0),
 	}
+
+	if !st.IsDir {
+		st.Mode = types.PermInfo{
+			Perm:         nst.mode.perm,
+			LastModefied: nst.mode.lastModefied,
+			CreateTime:   nst.mode.createTime,
+		}
+	}
+
 	index := len(*array)
 	*array = append(*array, st)
 	for _, v := range nst.children {
@@ -468,6 +684,11 @@ func (nst *NameSpaceTreeNode) Deserial(array []types.PersiteTreeNode, index int)
 	nst.isDir = array[index].IsDir
 	nst.length = array[index].Length
 	nst.name = array[index].Name
+	nst.mode = &FileMode{
+		perm:         array[index].Mode.Perm,
+		lastModefied: array[index].Mode.LastModefied,
+		createTime:   array[index].Mode.CreateTime,
+	}
 	for _, v := range array[index].Children {
 		node := &NameSpaceTreeNode{}
 		nst.children = append(nst.children, node.Deserial(array, v))
@@ -504,10 +725,17 @@ func (nsc *NameSpaceControlor) applyChangeFileInfo(path types.Path, meta types.P
 		if v.name == meta.Name {
 			v.chunks = meta.Chunks
 			v.length = meta.Length
+			v.mode = &FileMode{
+				perm:         meta.Mode.Perm,
+				lastModefied: meta.Mode.LastModefied,
+				createTime:   meta.Mode.CreateTime,
+			}
 		}
 	}
 	return nil
 }
+
+// 递归建目录
 func (nsc *NameSpaceControlor) applyCreated(path types.Path, meta []types.PersiteTreeNode) error {
 	_, cwd, err := nsc.lockUpperPath(path, false)
 	if err != nil {
@@ -523,60 +751,148 @@ func (nsc *NameSpaceControlor) applyCreated(path types.Path, meta []types.Persit
 	return nil
 }
 
-func (nsc *NameSpaceControlor) applyCreatef(path types.Path, meta types.PersiteTreeNode) error {
+// 批量创建目录
+func (nsc *NameSpaceControlor) applyBatchMkdir(path types.Path, meta [][]types.PersiteTreeNode) error {
+
+	_, cwd, err := nsc.lockUpperPath(path, false)
+
+	if err != nil {
+		return err
+	}
+
+	for _, v := range meta {
+
+		st := NameSpaceTreeNode{}
+
+		st.Deserial(v, 0)
+
+		cwd.children = append(cwd.children, &st)
+	}
+
+	return nil
+}
+
+// 批量创建文件
+func (nsc *NameSpaceControlor) applyCreatef(path types.Path, meta []types.PersiteTreeNode) error {
 	_, cwd, err := nsc.lockUpperPath(path, false)
 	if err != nil {
 		return err
 	}
 	var children []*NameSpaceTreeNode = nil
-	if meta.IsDir {
-		children = make([]*NameSpaceTreeNode, 0)
+	var errs []error
+	// if meta.IsDir {
+	// 	children = make([]*NameSpaceTreeNode, 0)
+	// }
+	for _, node := range meta {
+
+		if node.IsDir {
+			children = make([]*NameSpaceTreeNode, 0)
+		} else {
+			children = nil
+		}
+		if cwd.isExist(node.Name) {
+			errs = append(errs, types.Errln(types.ErrPathExists, node.Name))
+			continue
+		}
+		cwd.children = append(cwd.children, &NameSpaceTreeNode{
+			name:     node.Name,
+			isDir:    node.IsDir,
+			children: children,
+			chunks:   node.Chunks,
+			length:   node.Length,
+			mode: &FileMode{
+				perm:         node.Mode.Perm,
+				lastModefied: node.Mode.LastModefied,
+				createTime:   node.Mode.CreateTime,
+			},
+		})
 	}
-	cwd.children = append(cwd.children, &NameSpaceTreeNode{
-		name:     meta.Name,
-		isDir:    meta.IsDir,
-		children: children,
-		chunks:   meta.Chunks,
-		length:   meta.Length,
-	})
-	return nil
+	return common.JoinErrors(errs...)
 }
-func (nsc *NameSpaceControlor) applyDelete(path types.Path, meta types.PersiteTreeNode) error {
+
+// 批量删除
+func (nsc *NameSpaceControlor) applyDelete(path types.Path, meta []types.PersiteTreeNode) error {
 	_, cwd, err := nsc.lockUpperPath(path, false)
 	if err != nil {
 		return err
 	}
+	var errs []error
+	sl := make(map[string]types.PersiteTreeNode)
+
+	for idx, v := range meta {
+		sl[v.Name] = meta[idx]
+	}
 
 	for _, v := range cwd.children {
-		if v.name == meta.Name {
+		if _, ok := sl[v.name]; ok {
 			v.MarkDeleted()
+		} else {
+			errs = append(errs, types.Errln(types.ErrNotExist, v.name))
 		}
 	}
-	return nil
+	return common.JoinErrors(errs...)
 }
 func (nst *NameSpaceTreeNode) MustAddLength(do *wal.LogOpLet, path types.Path, lengths int64) error {
 	nst.RLock()
 	log := types.PersiteTreeNode{
 		IsDir:  false,
-		Name:   string(path) + "/" + nst.name,
+		Name:   nst.name,
 		Length: nst.length + lengths,
 		Chunks: nst.chunks,
+		Mode: types.PermInfo{
+			Perm:         nst.mode.perm,
+			LastModefied: nst.mode.lastModefied,
+			CreateTime:   nst.mode.createTime,
+		},
 	}
 	nst.RUnlock()
-	ctx, h := context.WithTimeout(context.TODO(), 3*time.Second)
+	ctx, h := context.WithTimeout(context.TODO(), common.ProposalTimeout)
 	defer h()
 	return do.NsStartCtx(ctx, log)
 }
-func (nst *NameSpaceTreeNode) MustAddChunks(do *wal.LogOpLet, path types.Path, chunks int64) error {
-	nst.RLock()
-	log := types.PersiteTreeNode{
-		IsDir:  false,
-		Name:   string(path) + "/" + nst.name,
-		Length: nst.length,
-		Chunks: nst.chunks + chunks,
+
+func (nst *NameSpaceTreeNode) MustUpdatePerm(do *wal.LogOpLet, path types.Path, perm types.FilePerm) error {
+	log := types.NsLogImpl{
+		CommandType: types.CommandUpdate,
+		Path:        path,
+		File: types.PersiteTreeNode{
+			Name:   nst.name,
+			Length: nst.length,
+			Chunks: nst.chunks,
+			Mode: types.PermInfo{
+				Perm:         perm,
+				LastModefied: nst.mode.lastModefied,
+				CreateTime:   nst.mode.createTime,
+			},
+		},
 	}
-	nst.RUnlock()
-	ctx, h := context.WithTimeout(context.TODO(), 3*time.Second)
+
+	//nst.RUnlock()
+	ctx, h := context.WithTimeout(context.TODO(), common.ProposalTimeout)
+	defer h()
+	return do.NsStartCtx(ctx, log)
+}
+
+func (nst *NameSpaceTreeNode) MustAddChunks(do *wal.LogOpLet, path types.Path, chunks int64) error {
+	//nst.RLock()
+
+	log := types.NsLogImpl{
+		CommandType: types.CommandUpdate,
+		Path:        path,
+		File: types.PersiteTreeNode{
+			Name:   nst.name,
+			Length: nst.length,
+			Chunks: nst.chunks + chunks,
+			Mode: types.PermInfo{
+				Perm:         nst.mode.perm,
+				LastModefied: nst.mode.lastModefied,
+				CreateTime:   nst.mode.createTime,
+			},
+		},
+	}
+
+	//nst.RUnlock()
+	ctx, h := context.WithTimeout(context.TODO(), common.ProposalTimeout)
 	defer h()
 	return do.NsStartCtx(ctx, log)
 }
@@ -590,24 +906,24 @@ func (nsc *NameSpaceControlor) MustMkdir(do *wal.LogOpLet, path types.Path, newn
 		Path:        path + types.Path("/"+newn.name),
 		Dics:        children,
 	}
-	ctx, h := context.WithTimeout(context.TODO(), 3*time.Second)
+	ctx, h := context.WithTimeout(context.TODO(), common.ProposalTimeout)
 	defer h()
 	return do.NsStartCtx(ctx, log)
 }
-func (nsc *NameSpaceControlor) MustDeleteFile(do *wal.LogOpLet, cwd *NameSpaceTreeNode, filename string) error {
+func (nsc *NameSpaceControlor) MustDeleteFile(do *wal.LogOpLet, cwd types.Path, filename string) error {
 	log := types.NsLogImpl{
 		CommandType: types.CommandDelete,
-		Path:        types.Path(cwd.name + "/" + filename),
+		Path:        cwd,
 		File: types.PersiteTreeNode{
 			IsDir: false,
 			Name:  filename,
 		},
 	}
-	ctx, h := context.WithTimeout(context.TODO(), 3*time.Second)
+	ctx, h := context.WithTimeout(context.TODO(), common.ProposalTimeout)
 	defer h()
 	return do.NsStartCtx(ctx, log)
 }
-func (nsc *NameSpaceControlor) MustCreateFile(do *wal.LogOpLet, cwd types.Path, filename string) error {
+func (nsc *NameSpaceControlor) MustCreateFile(do *wal.LogOpLet, cwd types.Path, filename string, perm types.FilePerm) error {
 	log := types.NsLogImpl{
 		CommandType: types.CommandCreate | types.OP_FILE,
 		Path:        cwd,
@@ -616,9 +932,96 @@ func (nsc *NameSpaceControlor) MustCreateFile(do *wal.LogOpLet, cwd types.Path, 
 			Name:   filename,
 			Length: 0,
 			Chunks: 0,
+			Mode: types.PermInfo{
+				Perm:         perm,
+				LastModefied: time.Now(),
+				CreateTime:   time.Now(),
+			},
 		},
 	}
-	ctx, h := context.WithTimeout(context.TODO(), 3*time.Second)
+	ctx, h := context.WithTimeout(context.TODO(), common.ProposalTimeout)
 	defer h()
 	return do.NsStartCtx(ctx, log)
+}
+
+func (nsc *NameSpaceControlor) MustCreateBatchFile(do *wal.LogOpLet, cwd types.Path, perm types.FilePerm, filename []string) error {
+	log := types.BatchLogImpl{
+		Type:  types.NsLog,
+		Batch: make([]interface{}, len(filename)),
+	}
+
+	for idx, v := range filename {
+
+		log.Batch[idx] = types.NsLogImpl{
+			CommandType: types.CommandCreate | types.OP_FILE,
+			Path:        cwd,
+			File: types.PersiteTreeNode{
+				IsDir:  false,
+				Name:   v,
+				Length: 0,
+				Chunks: 0,
+				Mode: types.PermInfo{
+					Perm:         perm,
+					LastModefied: time.Now(),
+					CreateTime:   time.Now(),
+				},
+			},
+		}
+	}
+
+	ctx, h := context.WithTimeout(context.TODO(), common.ProposalTimeout)
+
+	defer h()
+
+	return do.OpStartCtx(ctx, log)
+}
+
+func (nsc *NameSpaceControlor) MustDeleteBatchFile(do *wal.LogOpLet, cwd types.Path, filename []string) error {
+	log := types.BatchLogImpl{
+		Type:  types.NsLog,
+		Batch: make([]interface{}, len(filename)),
+	}
+
+	for idx, v := range filename {
+
+		log.Batch[idx] = types.NsLogImpl{
+			CommandType: types.CommandDelete,
+			Path:        cwd,
+			File: types.PersiteTreeNode{
+				Name:   v,
+				IsDir:  false,
+				Length: 0,
+				Chunks: 0,
+			},
+		}
+	}
+
+	ctx, h := context.WithTimeout(context.TODO(), common.ProposalTimeout)
+	defer h()
+	return do.OpStartCtx(ctx, log)
+}
+
+func (nsc *NameSpaceControlor) MustBatchMkdir(do *wal.LogOpLet, cwd types.Path, filename []string) error {
+	log := types.BatchLogImpl{
+		Type:  types.NsLog,
+		Batch: make([]interface{}, len(filename)),
+	}
+
+	for idx, v := range filename {
+		log.Batch[idx] = types.NsLogImpl{
+			CommandType: types.CommandCreate | types.OP_DIC,
+			Path:        cwd,
+			Dics: []types.PersiteTreeNode{
+				{
+					IsDir:    false,
+					Name:     v,
+					Children: make([]int, 0),
+				},
+			},
+		}
+	}
+
+	ctx, h := context.WithTimeout(context.TODO(), common.ProposalTimeout)
+	defer h()
+	return do.OpStartCtx(ctx, log)
 }

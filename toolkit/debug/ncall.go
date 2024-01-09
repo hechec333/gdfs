@@ -3,7 +3,7 @@ package main
 import (
 	"gdfs/config"
 	"gdfs/internal/common/rpc"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"log"
 	"reflect"
 	"sync"

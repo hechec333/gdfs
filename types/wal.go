@@ -8,6 +8,7 @@ import (
 func init() {
 	gob.Register(NsLogImpl{})
 	gob.Register(ChunkLogImpl{})
+	gob.Register(BatchLogImpl{})
 }
 
 type Version struct {
@@ -30,6 +31,7 @@ type IPersiter interface {
 const (
 	ChunkLog = iota
 	NsLog
+	BatchLog
 )
 
 const (
@@ -47,6 +49,12 @@ type RedoLog struct {
 	Type int
 	Txn  []interface{}
 }
+
+type BatchLogImpl struct {
+	Type  int
+	Batch []interface{}
+}
+
 type ChunkLogImpl struct {
 	CommandType int
 	Path        Path

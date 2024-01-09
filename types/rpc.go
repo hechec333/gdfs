@@ -9,6 +9,39 @@ type ClientIdentity struct {
 	Seq      int64
 }
 
+type GetFileDetailArg struct {
+	Path Path
+}
+type ChunkDetail struct {
+	Handle  ChunkHandle
+	Lease   LeaseInfo
+	Version int64
+}
+type GetFileDetailReply struct {
+	Length int64
+	Chunks []ChunkDetail
+}
+
+type BatchOpArg struct {
+	ClientIdentity
+	Method string
+	Cmd    []interface{}
+	Arg    []interface{}
+}
+
+type BatchOpReply struct {
+	Err    error
+	Status []interface{}
+}
+
+type GetFilePermArg struct {
+	Path Path
+}
+
+type GetFilePermReply struct {
+	Info FileInfo
+}
+
 type CreateChunkArg struct {
 	Handle ChunkHandle
 }
@@ -37,29 +70,37 @@ type ReportSelfArg struct {
 }
 
 type ReportSelfReply struct {
+	Pro    ServerProperty
 	Chunks []PersiteChunkInfo
 }
-
+type ForwardOption struct {
+	Sync            bool // 是否同步调用
+	AtLeastResponce int  // 最少同步等待结点数
+	Wait            int  // 最大同步等待时间,秒
+}
 type ForwardDataArg struct {
+	ForwardOption
 	DataID     DataBufferID
 	Data       []byte
 	ChainOrder []Addr
 }
 type ForwardDataReply struct {
-	ErrorCode string
+	RepsonceNode int // 成功复制的结点数
 }
 
+// chunkserver
 type ReadChunkArg struct {
 	Handle ChunkHandle
 	Offset int
 	Length int
+	Etag   string
 }
 type ReadChunkReply struct {
 	Data   []byte
 	Length int
 	Err    error
+	Etag   string
 }
-
 type WriteChunkArg struct {
 	DataID      DataBufferID
 	Offset      int64
@@ -67,6 +108,7 @@ type WriteChunkArg struct {
 }
 type WriteChunkReply struct {
 	ErrorCode string
+	Etag      string
 }
 
 type AppendChunkArg struct {
@@ -75,6 +117,7 @@ type AppendChunkArg struct {
 }
 type AppendChunkReply struct {
 	Offset int64
+	Etag   string
 	// ErrorCode string
 	Err error
 }
@@ -109,10 +152,16 @@ type GetPrimaryAndSecondariesArg struct {
 	ClientIdentity
 	Handle ChunkHandle
 }
+
+type EndpointInfo struct {
+	Addr     Addr
+	Property ServerProperty
+}
+
 type GetPrimaryAndSecondariesReply struct {
-	Primary     Addr
+	Primary     EndpointInfo
 	Expire      time.Time
-	Secondaries []Addr
+	Secondaries []EndpointInfo
 	Err         error
 }
 
@@ -120,10 +169,11 @@ type GetReplicasArg struct {
 	Handle ChunkHandle
 }
 type GetReplicasReply struct {
-	Locations []Addr
+	Locations []EndpointInfo
 }
 
 type GetFileInfoArg struct {
+	ClientIdentity
 	Path Path
 }
 type GetFileInfoReply struct {
@@ -132,6 +182,7 @@ type GetFileInfoReply struct {
 }
 
 type GetChunkHandleArg struct {
+	ClientIdentity
 	Path     Path
 	Index    int
 	ClientId int64
@@ -142,10 +193,19 @@ type GetChunkHandleReply struct {
 	Err    error
 }
 
+type SetFilePermArg struct {
+	ClientIdentity
+	Path Path
+	Perm FilePerm
+}
+
+type SetFilePermReply struct{}
+
 // namespace operation
 type CreateFileArg struct {
 	ClientIdentity
 	Path Path
+	Perm FilePerm
 }
 type CreateFileReply struct {
 }

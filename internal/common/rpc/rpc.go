@@ -3,7 +3,7 @@ package rpc
 import (
 	"errors"
 	"gdfs/internal/common"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"log"
 	"net"
 	"net/rpc"

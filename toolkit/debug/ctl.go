@@ -4,7 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"gdfs/config"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"os"
 	"reflect"
 	"text/tabwriter"

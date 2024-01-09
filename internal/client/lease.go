@@ -1,7 +1,7 @@
 package client
 
 import (
-	"gdfs/internal/types"
+	"gdfs/types"
 	"log"
 	"sync"
 	"time"
@@ -9,19 +9,21 @@ import (
 
 type leaseBuffer struct {
 	sync.RWMutex
-	buffer map[types.ChunkHandle]*types.LeaseInfo
-	tick   time.Duration
-	cli    *Client
-	roleCh chan struct{}
+	buffer   map[types.ChunkHandle]*types.LeaseInfo
+	endpoint map[types.ChunkHandle][]types.EndpointInfo
+	tick     time.Duration
+	cli      *Client
+	roleCh   chan struct{}
 }
 
 // 管理关于handle的租约信息
 func newLeaseBuffer(cli *Client, tick time.Duration) *leaseBuffer {
 	buf := &leaseBuffer{
-		buffer: make(map[types.ChunkHandle]*types.LeaseInfo),
-		tick:   tick,
-		cli:    cli,
-		roleCh: make(chan struct{}, 0),
+		buffer:   make(map[types.ChunkHandle]*types.LeaseInfo),
+		tick:     tick,
+		cli:      cli,
+		endpoint: make(map[types.ChunkHandle][]types.EndpointInfo),
+		roleCh:   make(chan struct{}, 0),
 	}
 
 	// clean task
@@ -48,6 +50,28 @@ func newLeaseBuffer(cli *Client, tick time.Duration) *leaseBuffer {
 	return buf
 }
 
+func (buf *leaseBuffer) GetEndpoint(handle types.ChunkHandle) ([]types.EndpointInfo, error) {
+	buf.Lock()
+	defer buf.Unlock()
+
+	ends, ok := buf.endpoint[handle]
+
+	if !ok {
+		var l types.GetReplicasReply
+		arg := types.GetReplicasArg{
+			Handle: handle,
+		}
+		err := buf.cli.do("Master.RPCGetReplicas", &arg, &l)
+		if err != nil {
+			return nil, err
+		}
+
+		buf.endpoint[handle] = l.Locations
+	}
+
+	return ends, nil
+}
+
 func (buf *leaseBuffer) Get(handle types.ChunkHandle) (*types.LeaseInfo, error) {
 	buf.Lock()
 	defer buf.Unlock()
@@ -65,21 +89,24 @@ func (buf *leaseBuffer) Get(handle types.ChunkHandle) (*types.LeaseInfo, error) 
 		}
 
 		lease = &types.LeaseInfo{
-			Primary: l.Primary,
-			Backups: l.Secondaries,
+			Primary: l.Primary.Addr,
 			Exipre:  l.Expire,
 		}
+		buf.endpoint[handle] = append(buf.endpoint[handle], types.EndpointInfo{
+			Addr:     l.Primary.Addr,
+			Property: l.Primary.Property,
+		})
+		for idx := range l.Secondaries {
+			lease.Backups = append(lease.Backups, l.Secondaries[idx].Addr)
+			buf.endpoint[handle] = append(buf.endpoint[handle], types.EndpointInfo{
+				Addr:     l.Secondaries[idx].Addr,
+				Property: l.Secondaries[idx].Property,
+			})
+		}
+
 		buf.buffer[handle] = lease
 		return lease, nil
 	}
-	// extend lease (it is the work of chunk server)
-	/*
-	   go func() {
-	       var r types.ExtendLeaseReply
-	       util.Call(buf.master, "Master.RPCExtendLease", types.ExtendLeaseArg{handle, lease.Primary}, &r)
-	       lease.Expire = r.Expire
-	   }()
-	*/
 	return lease, nil
 }
 

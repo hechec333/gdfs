@@ -6,9 +6,8 @@ import (
 	chunkserver "gdfs/internal/chunkServer"
 	"gdfs/internal/common"
 	"gdfs/internal/common/rpc"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"io"
-	"math/rand"
 	"path"
 	"reflect"
 	"sync"
@@ -18,55 +17,11 @@ import (
 type FileFlag uint16
 
 const (
-	O_CREATE FileFlag = iota << 1
+	O_CREATE FileFlag = 1 << iota
 	O_APPEND
 	O_RWONLY
+	O_RDONLY
 )
-
-type Writer struct {
-	sync.RWMutex
-	c    *Client
-	path types.Path
-	next int64
-}
-
-func (w *Writer) Write(b []byte) (int, error) {
-	return w.c.Write(w.path, w.next, b)
-}
-
-func (w *Writer) Seek(index int64) {
-	w.next = index
-}
-
-type Appender struct {
-	sync.RWMutex
-	c    *Client
-	path types.Path
-	next int64
-}
-
-func (w *Appender) Write(b []byte) (int, error) {
-	w.Lock()
-	defer w.Unlock()
-	n, err := w.c.Append(w.path, b)
-	wb := n - w.next
-	return int(wb), err
-}
-
-type Reader struct {
-	sync.RWMutex
-	c    *Client
-	path types.Path
-	seek int64
-}
-
-func (r *Reader) Read(b []byte) (int, error) {
-	return r.c.Read(r.path, r.seek, b)
-}
-
-func (r *Reader) Seek(index int64) {
-	r.seek = index
-}
 
 // Client struct is the types client-side driver
 type Client struct {
@@ -74,17 +29,24 @@ type Client struct {
 	clientId   int64
 	seq        int64
 	lastleader int
+	cfg        *ClientCfg
+	master     []types.Addr
+	leaseBuf   *leaseBuffer
+}
 
-	master   []types.Addr
-	leaseBuf *leaseBuffer
+type ClientConfig struct {
+	Master []types.Addr
 }
 
 // NewClient returns a new types client.
-func NewClient(master []types.Addr) *Client {
+func NewClient(config *ClientConfig, opts ...Option) *Client {
 	cli := &Client{
-		master:   master,
+		master:   config.Master,
 		leaseBuf: nil,
+		clientId: common.Nrand(),
+		cfg:      &ClientCfg{},
 	}
+	cli.cfg.Init(opts...)
 	cli.leaseBuf = newLeaseBuffer(cli, common.LeaseBufTick)
 	return cli
 }
@@ -108,6 +70,7 @@ func (c *Client) do(service string, arg any, reply any) error {
 	if rcv.Kind() == reflect.Ptr {
 		rcv = rcv.Elem()
 	}
+
 	f := rcv.FieldByName("ClientIdentity")
 	if f.IsValid() && f.CanSet() {
 		f.Set(reflect.ValueOf(types.ClientIdentity{
@@ -128,7 +91,7 @@ func (c *Client) do(service string, arg any, reply any) error {
 		if types.ErrEqual(err, types.ErrTimeOut) || types.ErrEqual(err, types.ErrRedirect) {
 			next = (next + 1) % len(c.master)
 			if next == c.lastleader {
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(common.ClientRoundStrip)
 			}
 			times++
 			if times >= common.MaxClientRetry*len(c.master) {
@@ -151,20 +114,79 @@ func (c *Client) do(service string, arg any, reply any) error {
 }
 
 // Create is a client API, creates a file
-func (c *Client) Create(path types.Path) error {
+func (c *Client) Create(path types.Path, mode FileMode) (*File, error) {
 	var reply types.CreateFileReply
 	arg := types.CreateFileArg{
 		ClientIdentity: types.ClientIdentity{},
 		Path:           path,
 	}
-	return c.do("Master.RPCCreateFile", &arg, &reply)
+	err := c.do("Master.RPCCreateFile", &arg, &reply)
+
+	return NewFile(c, path, 0), err
 }
 
-func (c *Client) OpenFile(path types.Path, mode int32) (*File, error) {
+func validPerm(clientperm uint8, fileperm types.FilePerm) bool {
+
+	// 去除O_CREATE标志
+	clientperm ^= uint8(O_CREATE)
+	// 如果以读写的方式打开,检测文件本身属性是否可写
+	if clientperm&uint8(O_RWONLY) == uint8(O_RWONLY) {
+		if fileperm > types.PermReadWrite {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Client) OpenFile(path types.Path, smode FileFlag) (*File, error) {
 	var (
 		f   *File
 		err error
 	)
+	mode := uint8(smode)
+	arg := types.PathExistArg{
+		Path: path,
+		Dir:  false,
+	}
+	reply := types.PathExistReply{}
+
+	err = c.do("Master.RPCPathExist", &arg, &reply)
+
+	if types.ErrEqual(err, types.ErrPathNotFound) && mode&uint8(O_CREATE) == uint8(O_CREATE) {
+		carg := types.CreateFileArg{
+			Path: path,
+			Perm: types.PermReadWrite,
+		}
+		x := types.CreateFileReply{}
+
+		err = c.do("Master.RPCCreateFile", &carg, &x)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if mode&uint8(O_CREATE) != uint8(O_CREATE) {
+		arg := types.GetFilePermArg{
+			Path: path,
+		}
+
+		reply := types.GetFilePermReply{}
+
+		err = c.do("Master.RPCGetFilePerm", &arg, &reply)
+
+		if err != nil {
+			return nil, err
+		}
+
+		ok := validPerm(mode, reply.Info.Mode.Perm)
+
+		if !ok {
+			err = types.ErrPermissionDenied
+		}
+	}
+
+	f = NewFile(c, path, 0)
 	return f, err
 }
 
@@ -247,18 +269,32 @@ func (c *Client) Read(path types.Path, offset int64, data []byte) (n int, err er
 		if err != nil {
 			return
 		}
-
+		// 数据传输开始
+		if c.cfg.trace.DataTransferStart != nil {
+			c.cfg.trace.DataTransferStart(index, int64(handle))
+		}
 		var n int
-		for {
+		retry := uint8(0)
+		for retry <= c.cfg.retry {
 			n, err = c.ReadChunk(handle, chunkOffset, data[pos:])
 			if err == nil || err == io.EOF {
 				break
 			}
-			// log.Warning("Read ", handle, " connection error, try again: ", err)
+			// 保持重试
+			common.LWarn("read %v connection error %v", handle, err)
+			// 重试行为
+			if c.cfg.trace.Retry != nil {
+				c.cfg.trace.Retry(retry)
+			}
+			retry++
 		}
 
 		offset += int64(n)
 		pos += n
+		// 数据传输结束
+		if c.cfg.trace.ChunkTransferDone != nil {
+			c.cfg.trace.ChunkTransferDone(index, int64(handle))
+		}
 		if err != nil {
 			break
 		}
@@ -273,7 +309,7 @@ func (c *Client) Write(path types.Path, offset int64, data []byte) (int, error) 
 	arg := &types.GetFileInfoArg{
 		Path: path,
 	}
-	err := c.do("Master.RPCGetFileInfo", &arg, &f)
+	err := c.do("Master.RPCGetFileInfo", arg, &f)
 	if err != nil {
 		return -1, err
 	}
@@ -373,8 +409,6 @@ func (c *Client) Append(path types.Path, data []byte) (offset int64, err error) 
 	return
 }
 
-// GetChunkHandle returns the chunk handle of (path, index).
-// If the chunk doesn't exist, master will create one.
 func (c *Client) GetChunkHandle(path types.Path, index int) (types.ChunkHandle, error) {
 	var reply types.GetChunkHandleReply
 	arg := types.GetChunkHandleArg{
@@ -388,8 +422,6 @@ func (c *Client) GetChunkHandle(path types.Path, index int) (types.ChunkHandle, 
 	return reply.Handle, reply.Err
 }
 
-// ReadChunk read data from the chunk at specific offset.
-// <code>len(data)+offset</data> should be within chunk size.
 func (c *Client) ReadChunk(handle types.ChunkHandle, offset int64, data []byte) (int, error) {
 	var readLen int
 
@@ -399,35 +431,45 @@ func (c *Client) ReadChunk(handle types.ChunkHandle, offset int64, data []byte) 
 		readLen = int(common.MaxChunkSize - offset)
 	}
 
-	var l types.GetReplicasReply
-	arg := types.GetReplicasArg{
-		Handle: handle,
-	}
-	err := c.do("Master.RPCGetReplicas", &arg, &l)
+	ends, err := c.leaseBuf.GetEndpoint(handle)
 	if err != nil {
-		return 0, err
+		return -1, err
 	}
-	loc := l.Locations[rand.Intn(len(l.Locations))]
-	if len(l.Locations) == 0 {
+	if len(ends) == 0 {
 		return 0, types.ErrOutOfReplicas
 	}
+	// 分片负载均衡开始
+	if c.cfg.trace.PickStart != nil {
+		c.cfg.trace.PickStart(ends)
+	}
 
-	var r types.ReadChunkReply
-	argz := &types.ReadChunkArg{
+	loc := c.cfg.lb.Pick(ends)
+	// 分片负载均衡结束
+	if c.cfg.trace.PickEndpointDone != nil {
+		c.cfg.trace.PickEndpointDone(loc)
+	}
+
+	r := types.ReadChunkReply{}
+	argz := types.ReadChunkArg{
 		Handle: handle,
 		Offset: int(offset),
 		Length: readLen,
 	}
 	r.Data = data
-	err = rpc.Call(loc, "ChunkServer.RPCReadChunk", &argz, &r)
+	err = rpc.Call(loc.Addr, "ChunkServer.RPCReadChunk", &argz, &r)
 	if err != nil {
-		return 0, err
+		if types.ErrEqual(err, io.EOF) {
+			err = io.EOF
+		}
 	}
-	return r.Length, r.Err
+	if r.Err != nil {
+		if types.ErrEqual(r.Err, io.EOF) {
+			err = io.EOF
+		}
+	}
+	return r.Length, err
 }
 
-// WriteChunk writes data to the chunk at specific offset.
-// <code>len(data)+offset</data> should be within chunk size.
 func (c *Client) WriteChunk(handle types.ChunkHandle, offset int64, data []byte) error {
 	if int64(len(data))+int64(offset) > common.MaxChunkSize {
 		return fmt.Errorf("len(data)+offset = %v > max chunk size %v", len(data)+int(offset), common.MaxChunkSize)
@@ -461,9 +503,6 @@ func (c *Client) WriteChunk(handle types.ChunkHandle, offset int64, data []byte)
 	return err
 }
 
-// AppendChunk appends data to a chunk.
-// Chunk offset of the start of data will be returned if success.
-// <code>len(data)</code> should be within 1/4 chunk size.
 func (c *Client) AppendChunk(handle types.ChunkHandle, data []byte) (offset int64, err error) {
 	if len(data) > int(common.MaxAppendSize) {
 		return 0, fmt.Errorf("len(data) = %v > max append size %v", len(data), common.MaxAppendSize)

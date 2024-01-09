@@ -2,7 +2,7 @@ package mr
 
 import (
 	"gdfs/internal/client"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"io"
 	"os"
 )

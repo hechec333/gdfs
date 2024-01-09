@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"gdfs/internal/common"
 	"gdfs/internal/common/rpc"
-	"gdfs/internal/types"
 	"gdfs/internal/wal"
+	"gdfs/types"
 	"log"
 	"math/rand"
 	"sort"
@@ -145,7 +145,7 @@ func (cc *ChunkControlor) MustCreateChunk(do *wal.LogOpLet, f *FileInfo, path ty
 	f.Lock()
 	defer f.Unlock()
 	handle := types.ChunkHandle(common.GetChunkHandleId())
-	f.Handles[len(f.Handles)] = handle
+	//f.Handles[len(f.Handles)] = handle
 	log := types.ChunkLogImpl{
 		CommandType: types.CommandCreate,
 		Path:        path,
@@ -154,7 +154,7 @@ func (cc *ChunkControlor) MustCreateChunk(do *wal.LogOpLet, f *FileInfo, path ty
 			ChunkHandle: handle,
 		},
 	}
-	ctx, h := context.WithTimeout(context.TODO(), 1*time.Second)
+	ctx, h := context.WithTimeout(context.TODO(), common.ProposalTimeout)
 	defer h()
 	return handle, do.ChunkStartCtx(ctx, log)
 }
@@ -168,6 +168,7 @@ func (cc *ChunkControlor) applyCreateChunk(path types.Path, meta types.PersiteCh
 			RefCount: 1,
 			Handles:  make(map[int]types.ChunkHandle),
 		}
+		file = cc.Files[path]
 	}
 
 	ck := ChunkInfo{
@@ -188,43 +189,43 @@ func (cc *ChunkControlor) MustChangeChunk(do *wal.LogOpLet, handle types.ChunkHa
 		Path:        ck.Path,
 		Chunk:       ckc,
 	}
-	ctx, h := context.WithTimeout(context.TODO(), 1*time.Second)
+	ctx, h := context.WithTimeout(context.TODO(), common.ProposalTimeout)
 	defer h()
 	return do.ChunkStartCtx(ctx, log)
 }
 
 func (cc *ChunkControlor) applyChangeChunk(path types.Path, meta types.PersiteChunkInfo) error {
-	cc.RLock()
+	//cc.RLock()
 	file, ok := cc.Files[path]
 	if !ok {
-		cc.RUnlock()
+		//cc.RUnlock()
 		return types.ErrNotExist
 	}
 	idx := file.HasChunk(meta.ChunkHandle)
 	if idx == -1 {
-		cc.RUnlock()
+		//cc.RUnlock()
 		return types.ErrNotExist
 	}
 	ck, ok := cc.Chunk[meta.ChunkHandle]
 	if !ok {
-		cc.RUnlock()
+		//cc.RUnlock()
 		return types.ErrNotExist
 	}
-	cc.RUnlock()
+	//cc.RUnlock()
 	file.Lock()
 	defer file.Unlock()
 	if file.Handles[idx] != meta.ChunkHandle {
-		cc.Lock()
-		defer cc.Unlock()
+		//cc.Lock()
 		handle := file.Handles[idx]
 		ckc := cc.Chunk[handle]
 		delete(cc.Chunk, file.Handles[idx])
 		file.Handles[idx] = meta.ChunkHandle
 		cc.Chunk[meta.ChunkHandle] = ckc
 		ck = ckc
+		//cc.Unlock()
 	}
-	ck.Lock()
-	defer ck.Unlock()
+	// ck.Lock()
+	// defer ck.Unlock()
 
 	ck.CheckSum = int64(meta.CheckSum)
 	ck.Version = meta.Version
@@ -338,7 +339,7 @@ func (cc *ChunkControlor) CreateChunk(do *wal.LogOpLet, path types.Path, servers
 			args := types.CreateChunkArg{
 				Handle: handle,
 			}
-			err := rpc.Call(peer, "ChunkServer.CreateChunk", &args, &resp)
+			err := rpc.Call(peer, "ChunkServer.RPCCreateChunk", &args, &resp)
 			ck.Lock()
 			defer ck.Unlock()
 			if err != nil {
@@ -364,7 +365,7 @@ func (cc *ChunkControlor) CreateChunk(do *wal.LogOpLet, path types.Path, servers
 // 如果检测到接近阀值会调度分片
 func (cc *ChunkControlor) RemoveChunk(do *wal.LogOpLet, handles []types.ChunkHandle, server types.Addr) error {
 	cc.Lock()
-
+	defer cc.Unlock()
 	for _, handle := range handles {
 		ck := cc.Chunk[handle]
 		ck.Lock()
@@ -394,8 +395,6 @@ func (cc *ChunkControlor) RemoveChunk(do *wal.LogOpLet, handles []types.ChunkHan
 		}
 	}
 
-	cc.Unlock()
-
 	return nil
 }
 
@@ -414,7 +413,7 @@ func (cc *ChunkControlor) GetReplicas(handle types.ChunkHandle) ([]types.Addr, e
 func (cc *ChunkControlor) GetLease(do *wal.LogOpLet, handle types.ChunkHandle) (*Lease, []types.Addr, error) {
 	cc.RLock()
 	ck, ok := cc.Chunk[handle]
-	cc.RUnlock()
+	defer cc.RUnlock()
 
 	if !ok {
 		return nil, nil, fmt.Errorf("invalid chunk %v", handle)
@@ -431,18 +430,18 @@ func (cc *ChunkControlor) GetLease(do *wal.LogOpLet, handle types.ChunkHandle) (
 			CheckSum:    int(ck.CheckSum),
 			ChunkHandle: handle,
 		}
-
+		version := ck.Version
 		err := cc.MustChangeChunk(do, handle, ckc)
 		if err != nil {
 			panic(err)
 		}
-		cc.RLock()
+		//cc.RLock()
 		ck := cc.Chunk[handle]
-		cc.RUnlock()
+		//cc.RUnlock()
 
 		arg := types.CheckReplicaVersionArg{
 			Handle:  handle,
-			Version: ck.Version,
+			Version: version + 1,
 		}
 		ck.Unlock()
 		var wg sync.WaitGroup
@@ -452,7 +451,7 @@ func (cc *ChunkControlor) GetLease(do *wal.LogOpLet, handle types.ChunkHandle) (
 			wg.Add(1)
 			go func(peer types.Addr) {
 				var reply types.CheckReplicaVersionReply
-				err := rpc.Call(peer, "ChunkServer.CheckReplicaVersion", &arg, &reply)
+				err := rpc.Call(peer, "ChunkServer.RPCCheckReplicaVersion", &arg, &reply)
 				mu.Lock()
 				defer mu.Unlock()
 				if err == nil && !reply.IsStale {
@@ -467,16 +466,17 @@ func (cc *ChunkControlor) GetLease(do *wal.LogOpLet, handle types.ChunkHandle) (
 
 		wg.Wait()
 		ck.Lock()
-		defer ck.Unlock()
+		//defer ck.Unlock()
 		ck.Replicas = make([]types.Addr, 0)
 		ck.Replicas = append(ck.Replicas, newList...)
 		if len(ck.Replicas) < common.MinChunks {
-			cc.Lock()
+			//cc.Lock()
 			cc.replicaNeedList = append(cc.replicaNeedList, handle)
-			cc.Unlock()
+			//cc.Unlock()
 			if len(ck.Replicas) == 0 {
 				ck.Version-- // why?
 				log.Printf("lose all replicas %v", handle)
+				goto ret
 			}
 		}
 
@@ -488,7 +488,14 @@ func (cc *ChunkControlor) GetLease(do *wal.LogOpLet, handle types.ChunkHandle) (
 		ck.Primary = ck.Replicas[n]
 		ck.Expire = time.Now().Add(time.Duration(common.ExpireTimeout) * time.Second)
 	}
+ret:
 	ck.Unlock()
+
+	lease.Location = make([]types.Addr, len(ck.Replicas))
+	copy(lease.Location, ck.Replicas)
+
+	lease.Primary = ck.Primary
+	lease.Expire = ck.Expire
 	return &lease, oldServers, nil
 }
 

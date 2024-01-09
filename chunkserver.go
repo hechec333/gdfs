@@ -4,7 +4,7 @@ import (
 	"gdfs/config"
 	chunkserver "gdfs/internal/chunkServer"
 	"gdfs/internal/common"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"log"
 	"os"
 	"strconv"
@@ -32,7 +32,6 @@ func NewChunkServer(uuid int64) *chunkserver.ChunkServer {
 		if err != nil {
 			panic("GDFS_UUID is invalid")
 		}
-
 		for _, v := range cc.Cluster.Cs.Nodes {
 			if v.Uuid == xid {
 				cfg.Address = types.Addr(v.Address + ":" + v.Port)

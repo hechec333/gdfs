@@ -23,7 +23,7 @@ import (
 	"encoding/gob"
 	"gdfs/internal/common"
 	"gdfs/internal/common/rpc"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"io"
 	"math/rand"
 	"sync"
@@ -98,6 +98,8 @@ type Raft struct {
 	Lease             LeaderLease
 
 	Event chan int
+
+	EventMap map[EventType][]chan Event
 }
 
 func (rf *Raft) HasLeaderLease() bool {
@@ -728,10 +730,16 @@ func (rf *Raft) GlobalFetchLog(index int) Entry {
 	}
 }
 
+// 这里有问题，如果一个新的leader再任期间没有提交日志，那么它的commitindex将不会变化！
+// 这对实现local-lease-read有很大障碍，因为lease-read没有经过提案
+// 考虑readindex的实现方案
+
 func (rf *Raft) LeaderCommit() {
 	if rf.State != Leader {
 		return
 	}
+
+	// FIXME if all the log are smaller than
 
 	for n := rf.CommitIndex + 1; n <= rf.getLastLogIndex(); n++ {
 		// if rf.logEntries[n-1].Term != rf.CurrentTerm {
@@ -752,7 +760,8 @@ func (rf *Raft) LeaderCommit() {
 			if 2*counter > len(rf.peers) {
 				rf.CommitIndex = n
 				// time to apply
-				DPrintf("[R][%v] CommitIndex %v", GetRole(rf.State), rf.CommitIndex)
+				common.LTrace("[R][%v] CommitIndex %v", GetRole(rf.State), rf.CommitIndex)
+				//DPrintf("[R][%v] CommitIndex %v", GetRole(rf.State), rf.CommitIndex)
 				rf.Apply()
 				break
 			}
@@ -763,20 +772,25 @@ func (rf *Raft) LeaderCommit() {
 
 // check 标识是否是心跳包
 // 调用方必须持有锁
-func (rf *Raft) doAE(check bool) {
+func (rf *Raft) doAE(check bool, done ...func()) {
 	var count int32 = 1 //发往自身的AE永远成功
 	aedone := func(stat bool, peer int) {
 		if !stat {
 			return
 		}
-		atomic.AddInt32(&count, 1)
+		if len(rf.peers) > 1 {
+			atomic.AddInt32(&count, 1)
+		}
 		if atomic.CompareAndSwapInt32(&count, int32(len(rf.peers)/2+1), 0) {
 			common.LInfo("<Raft>[Leader] Keeping Lease")
 			rf.Lease.keepLease(rf.ElecTimeout.TimeOuts)
+			for _, v := range done {
+				v()
+			}
 		}
 	}
-	if len(rf.peers) == 1 && !check {
-		rf.ElecTimeout.RefreshElecTimer()
+	if len(rf.peers) == 1 {
+		//rf.ElecTimeout.RefreshElecTimer()
 		rf.LeaderCommit()
 		aedone(true, 0)
 	}
@@ -986,8 +1000,30 @@ func (rf *Raft) becomeLeader() {
 		rf.MatchIndex[i] = rf.CommitIndex
 	}
 	rf.ElecFailTime = 0
+
+	// readindex implements
+	//rf.readIndexInit()
 	//DPrintf("[R][%v][DEBUG] NextIndex: %v", GetRole(rf.State), rf.NextIndex)
 	//common.LInfo("<Raft>[%v] become Leader,id:%v,Term:%v,logs:%v", GetRole(rf.State), rf.me, rf.CurrentTerm, rf.logEntries)
+
+	event := Event{
+		Stat: ROLE_CHANGE,
+		Arg:  Leader,
+		Term: rf.CurrentTerm,
+	}
+
+	chs, ok := rf.EventMap[ROLE_CHANGE]
+
+	if !ok {
+		return
+	}
+
+	for _, v := range chs {
+		select {
+		case v <- event:
+		default:
+		}
+	}
 }
 
 // 通知提交日志
@@ -1090,6 +1126,32 @@ func (rf *Raft) GetRaftStateSize() int {
 	return rf.persister.RaftStateSize()
 }
 
+func (rf *Raft) GetCommitIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.CommitIndex
+}
+
+// 等待一轮lease同步完成，有可能永远同步不完成
+func (rf *Raft) SyncLease() <-chan struct{} {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	ch := make(chan struct{}, 1)
+
+	done := func() {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+
+	rf.doAE(true, done)
+
+	return ch
+}
+
 func (rf *Raft) notify(who int) {
 	select {
 	case rf.Event <- who:
@@ -1099,6 +1161,33 @@ func (rf *Raft) notify(who int) {
 
 func (rf *Raft) RoleChange() <-chan int {
 	return rf.Event
+}
+
+type EventType uint8
+
+const (
+	ROLE_CHANGE EventType = iota + 1
+)
+
+type Event struct {
+	Stat EventType
+	Arg  interface{}
+	Term int
+}
+
+func (rf *Raft) Watch(t EventType) <-chan Event {
+
+	if rf.EventMap == nil {
+		rf.EventMap = make(map[EventType][]chan Event)
+	}
+
+	if _, ok := rf.EventMap[t]; !ok {
+		rf.EventMap[t] = make([]chan Event, 0)
+	}
+	ch := make(chan Event)
+	rf.EventMap[t] = append(rf.EventMap[t], ch)
+
+	return ch
 }
 
 // 初始化一个Raft Peer

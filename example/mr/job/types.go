@@ -10,12 +10,23 @@ type TaskConfig struct {
 	Remotes []string `json:"remotes"`
 }
 
+type TaskStage uint8
+
+const (
+	STAGE_MAP TaskStage = iota
+	STAGE_WAIT
+	STAGE_REDUCE
+	STAGE_DONE
+)
+
 type TaskInfo struct {
 	// 0->map 1->reduce 2->phrase-wait 3->exit
-	State int
-
-	FileName string
-
+	State         int
+	Seq           int //序列号
+	TaskId        int64
+	FileName      string
+	StartPos      int64 //
+	EndPos        int64 // -1 代表读到尾部
 	ReduceFileIdx int
 	MapFileIdx    int
 	// reduce num

@@ -1,44 +1,49 @@
 package chunkserver
 
 import (
+	"bytes"
+	"context"
 	"encoding/gob"
 	"errors"
 	"fmt"
 	"gdfs/internal/common"
 	xrpc "gdfs/internal/common/rpc"
-	"gdfs/internal/types"
+	"gdfs/proto"
+	"gdfs/types"
 	"io"
 	"log"
 	"net"
 	"net/rpc"
 	"os"
+	"os/signal"
 	"path"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 type ChunkServer struct {
-	lock     sync.RWMutex
-	address  types.Addr   // chunkserver address
-	masters  []types.Addr // master address
-	who      int
-	spin     int // total spin times
-	lastspin time.Time
-	spinidle time.Duration // total time cost in spin to check master
-	rootDir  string        // path to data storage
-	l        net.Listener
-	shutdown chan struct{}
-
+	proto.UnimplementedChunkServerServer
+	lock                   sync.RWMutex
+	address                types.Addr   // chunkserver address
+	masters                []types.Addr // master address
+	who                    int
+	spin                   int // total spin times
+	lastspin               time.Time
+	spinidle               time.Duration // total time cost in spin to check master
+	rootDir                string        // path to data storage
+	l                      net.Listener
+	shutdown               chan struct{}
+	property               types.ServerProperty
 	dl                     *CacheBuffer                     // expiring download buffer
 	chunk                  map[types.ChunkHandle]*chunkInfo // chunk information
 	dead                   bool                             // set to ture if server is shuntdown
 	pendingLeaseExtensions []types.ChunkHandle              // pending lease extension
 	garbage                []types.ChunkHandle              // garbages
-
-	clientid int64
-	seq      int64
-	mu       sync.Mutex
+	clientid               int64
+	seq                    int64
+	mu                     sync.Mutex
 }
 
 type Mutation struct {
@@ -91,6 +96,7 @@ func MustNewAndServe(config *types.ChunkServerServeConfig) *ChunkServer {
 		shutdown: make(chan struct{}),
 		dl:       newCacheBuffer(common.CacheBufferExpire, common.CacheBufferTick),
 		dead:     false,
+		property: types.ServerProperty{Property: config.Pro},
 		garbage:  make([]types.ChunkHandle, 0),
 		chunk:    make(map[types.ChunkHandle]*chunkInfo),
 		seq:      0,
@@ -126,9 +132,19 @@ func MustNewAndServe(config *types.ChunkServerServeConfig) *ChunkServer {
 	return cs
 }
 
-func (cs *ChunkServer) Stop() {
+// 阻塞等待信号
+func (cs *ChunkServer) GraceStop() error {
+	var err error
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	<-ch
+	err = cs.persiteMetaData()
+
 	cs.shutdown <- struct{}{}
+	return err
 }
+
 func (cs *ChunkServer) metaName() string {
 	return "ck-" + string(cs.address) + ".meta"
 }
@@ -148,7 +164,6 @@ func (cs *ChunkServer) GoBackGroundTask() {
 		if err != nil {
 			log.Println("[WARN] BackGroundTask error", err)
 		}
-
 	}
 }
 func (cs *ChunkServer) GoHeartbeat() {
@@ -290,7 +305,9 @@ func (cs *ChunkServer) RPCReportSelf(args *types.ReportSelfArg, reply *types.Rep
 			ChunkHandle: k,
 		})
 	}
-
+	reply.Pro = types.ServerProperty{
+		Property: cs.property.Property,
+	}
 	reply.Chunks = chunks
 	return nil
 }
@@ -422,15 +439,17 @@ func (cs *ChunkServer) RPCCreateChunk(args *types.CreateChunkArg, reply *types.C
 	}
 
 	cs.chunk[args.Handle] = &chunkInfo{
-		length: 0,
+		length:  0,
+		version: 1,
 	}
-	filename := path.Join(cs.rootDir, fmt.Sprintf("chunk%v.chk", args.Handle))
+	filename := path.Join(cs.rootDir, fmt.Sprintf("chunk-%v-%v.chk", cs.address, args.Handle))
 	_, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		return err
 	}
 	return nil
 }
+
 func (cs *ChunkServer) RPCReadChunk(args *types.ReadChunkArg, reply *types.ReadChunkReply) error {
 	handle := args.Handle
 	cs.lock.RLock()
@@ -442,18 +461,19 @@ func (cs *ChunkServer) RPCReadChunk(args *types.ReadChunkArg, reply *types.ReadC
 
 	// read from disk
 	var err error
-	reply.Data = make([]byte, args.Length)
-	ck.RLock()
-	reply.Length, err = cs.readChunk(handle, args.Offset, reply.Data)
-	ck.RUnlock()
-	if err == io.EOF {
-		reply.Err = io.EOF
+	data := make([]byte, args.Length)
+
+	// 判断是否命中客户端缓存
+	etag, _ := cs.GetEtag(args.Handle, ck)
+	if args.Etag == etag && args.Etag != "" {
 		return nil
 	}
 
-	if err != nil {
-		return err
-	}
+	ck.RLock()
+	reply.Length, err = cs.readChunk(handle, args.Offset, data)
+	ck.RUnlock()
+	reply.Data = append(reply.Data, data...)
+	reply.Err = types.NewError(err)
 	return nil
 }
 func (cs *ChunkServer) RPCWriteChunk(args *types.WriteChunkArg, reply *types.WriteChunkReply) error {
@@ -549,7 +569,7 @@ func (cs *ChunkServer) RPCAppendChunk(args *types.AppendChunkArg, reply *types.A
 		if newLen > int(common.MaxChunkSize) {
 			mtype = types.MutationPad
 			ck.length = int(common.MaxChunkSize)
-			reply.Err = types.ErrAppendExceed
+			reply.Err = types.NewError(types.ErrAppendExceed)
 		} else {
 			mtype = types.MutationAppend
 			ck.length = newLen
@@ -664,6 +684,29 @@ func (cs *ChunkServer) RPCSendCopy(args *types.SendCopyArg, reply *types.SendCop
 	return nil
 }
 
+// 获取指定chunk的etag
+// etag包含chunk检验和，chunk最后更改时间
+func (cs *ChunkServer) GetEtag(handle types.ChunkHandle, cki *chunkInfo) (string, error) {
+
+	filename := fmt.Sprintf("chunk-%v-%v.chk", cs.address, handle)
+
+	f, err := os.Open(filename)
+
+	if err != nil {
+		return "", err
+	}
+
+	st, err := f.Stat()
+
+	if err != nil {
+		return "", err
+	}
+
+	etag := common.GetEtag(cki.checksum, st.ModTime().Unix())
+
+	return etag, err
+}
+
 func (cs *ChunkServer) RPCApplyCopy(args *types.ApplyCopyArg, reply *types.ApplyCopyReply) error {
 	handle := args.Handle
 	cs.lock.RLock()
@@ -703,7 +746,7 @@ func (cs *ChunkServer) writeChunk(handle types.ChunkHandle, data []byte, offset 
 
 	//log.Infof("Server %v : write to chunk %v at %v len %v", cs.address, handle, offset, len(data))
 	common.LInfo("Server %v : write to chunk %v at %v len %v", cs.address, handle, offset, len(data))
-	filename := path.Join(cs.rootDir, fmt.Sprintf("chunk%v.chk", handle))
+	filename := path.Join(cs.rootDir, fmt.Sprintf("chunk-%v-%v.chk", cs.address, handle))
 	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, FilePerm)
 	if err != nil {
 		return err
@@ -714,13 +757,15 @@ func (cs *ChunkServer) writeChunk(handle types.ChunkHandle, data []byte, offset 
 	if err != nil {
 		return err
 	}
-
+	buf := new(bytes.Buffer)
+	io.Copy(buf, file)
+	ck.checksum = int(common.GetCrc32(buf.Bytes()))
 	return nil
 }
 
 // readChunk reads data at offset from a chunk at dist
 func (cs *ChunkServer) readChunk(handle types.ChunkHandle, offset int, data []byte) (int, error) {
-	filename := path.Join(cs.rootDir, fmt.Sprintf("chunk%v.chk", handle))
+	filename := path.Join(cs.rootDir, fmt.Sprintf("chunk-%v-%v.chk", cs.address, handle))
 
 	f, err := os.Open(filename)
 	if err != nil {
@@ -738,7 +783,7 @@ func (cs *ChunkServer) deleteChunk(handle types.ChunkHandle) error {
 	delete(cs.chunk, handle)
 	cs.lock.Unlock()
 
-	filename := path.Join(cs.rootDir, fmt.Sprintf("chunk%v.chk", handle))
+	filename := path.Join(cs.rootDir, fmt.Sprintf("chunk-%v-%v.chk", cs.address, handle))
 	err := os.Remove(filename)
 	return err
 }
@@ -772,4 +817,29 @@ func (cs *ChunkServer) doMutation(handle types.ChunkHandle, m *Mutation) error {
 	}
 
 	return nil
+}
+
+// grpc implentments
+
+func (cs *ChunkServer) GRPCReadChunk(ctx context.Context, req *proto.ReadChunkArg) (*proto.ReadChunkReply, error) {
+	arg := types.ReadChunkArg{
+		Handle: types.ChunkHandle(req.Handle),
+		Offset: int(req.Offset),
+		Length: int(req.Length),
+	}
+	var reply types.ReadChunkReply
+	err := cs.RPCReadChunk(&arg, &reply)
+
+	return &proto.ReadChunkReply{
+		Data:   reply.Data,
+		Length: req.Length,
+	}, err
+}
+
+func (cs *ChunkServer) GRPCWriteChunk() {
+
+}
+
+func (cs *ChunkServer) GRPCAppendChunk() {
+
 }

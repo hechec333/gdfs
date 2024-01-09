@@ -348,12 +348,6 @@ func (d *Daemon) ApiServer(addr string) error {
 
 	d.registerRoutes()
 
-	l, err := net.Listen("tcp", addr)
-
-	if err != nil {
-		return err
-	}
-
 	return http.ListenAndServe(addr, nil)
 }
 
@@ -391,6 +385,7 @@ func (d *Daemon) RPCAskNewTask(arg *NewTaskArg, reply *NewTaskReply) error {
 	return nil
 }
 
+// 启动注册worker
 func (d *Daemon) RPCRegister(arg *RegisterArg, reply *RegisterReply) error {
 	d.Lock()
 	defer d.Unlock()
@@ -410,11 +405,13 @@ func (d *Daemon) RPCRegister(arg *RegisterArg, reply *RegisterReply) error {
 	return nil
 }
 
+// Worker心跳
 func (d *Daemon) RPCHeartBeat(arg *HeartBeatArg, reply HeartBeatReply) error {
 
 	return nil
 }
 
+// job启动阶段的校验结果
 func (d *Daemon) RPCCheck(arg *CheckArg, reply *CheckReply) error {
 
 	d.Lock()

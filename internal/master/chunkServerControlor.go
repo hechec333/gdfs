@@ -3,7 +3,7 @@ package master
 import (
 	"fmt"
 	"gdfs/internal/common"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"log"
 	"math/rand"
 	"sync"
@@ -13,6 +13,7 @@ import (
 type ChunkServerInfo struct {
 	heartbeat time.Time
 	chunks    []types.ChunkHandle
+	property  map[string]interface{}
 	garbage   []types.ChunkHandle
 }
 type ChunkServerControlor struct {
@@ -37,6 +38,18 @@ func (csi *ChunkServerInfo) HasChunk(handle types.ChunkHandle) bool {
 func (csc *ChunkServerControlor) ClearAllVoliateStateAndRebuild() {
 	csc.servers = make(map[types.Addr]*ChunkServerInfo)
 }
+
+func (csc *ChunkServerControlor) UpdateServerProperty(server types.Addr, pro types.ServerProperty) {
+
+	csc.Lock()
+	defer csc.Unlock()
+
+	if _, ok := csc.servers[server]; !ok {
+		return
+	}
+	csc.servers[server].property = pro.Property
+}
+
 func (csc *ChunkServerControlor) HeartBeat(server types.Addr, reply *types.HeartbeatReply) bool {
 	csc.Lock()
 	defer csc.Unlock()
@@ -48,6 +61,7 @@ func (csc *ChunkServerControlor) HeartBeat(server types.Addr, reply *types.Heart
 		csc.servers[server] = &ChunkServerInfo{
 			heartbeat: time.Now(),
 			chunks:    make([]types.ChunkHandle, 0),
+			property:  make(map[string]interface{}),
 			garbage:   make([]types.ChunkHandle, 0),
 		}
 		return true
@@ -107,6 +121,15 @@ func (csc *ChunkServerControlor) CopyChunk(handle types.ChunkHandle) (from, to t
 	return owns[k], notowns[i], nil
 }
 
+func (csc *ChunkServerControlor) GetServerProperty(server types.Addr) types.ServerProperty {
+	csc.RLock()
+	defer csc.RUnlock()
+
+	return types.ServerProperty{
+		Property: csc.servers[server].property,
+	}
+}
+
 // 获取当前活跃可以派发分片的cs
 func (csc *ChunkServerControlor) ScheduleActiveServers(num int) ([]types.Addr, error) {
 	all := []types.Addr{}
@@ -115,9 +138,15 @@ func (csc *ChunkServerControlor) ScheduleActiveServers(num int) ([]types.Addr, e
 		all = append(all, s)
 	}
 	csc.RUnlock()
-	if num > len(all) || num < 1 {
+	if num < 1 {
 		return nil, fmt.Errorf("invalid numbers of servers")
 	}
+
+	if num > len(all) {
+		common.LInfo("replicate level big than cluster size [%v/%v],choose %v", num, len(all), len(all))
+		num = len(all)
+	}
+
 	seq := rand.Perm(len(all))[:num]
 	selects := []types.Addr{}
 	for _, v := range seq {

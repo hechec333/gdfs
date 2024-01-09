@@ -1,7 +1,7 @@
 package chunkserver
 
 import (
-	"gdfs/internal/types"
+	"gdfs/types"
 	"sync"
 	"time"
 )

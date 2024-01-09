@@ -1,10 +1,13 @@
 package mr
 
 import (
+	"context"
 	crand "crypto/rand"
+	"encoding/binary"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"hash/fnv"
 	"io"
 	"io/ioutil"
@@ -17,6 +20,7 @@ import (
 	"plugin"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,6 +33,7 @@ type KeyValue struct {
 
 var (
 	maxtaskparrel int = 2
+	maxPolldesc       = 1 * time.Second
 )
 
 type kvSlice []KeyValue
@@ -49,13 +54,31 @@ var moduelName = ""
 
 type TaskStat struct {
 	TaskId     int64
+	TaskName   string
 	MasterAddr string
 	Seq        int
-	mapf       func(string, string) []KeyValue
+	mapf       func(string) []KeyValue
 	reducef    func(string, []string) string
 	driver     StorageDriver
 	History    []string
 	w          *Worker
+	Cfg        TaskConfig
+
+	lastidle time.Time
+	next     chan struct{}
+	laststat *TaskInfo
+}
+
+func (t *TaskStat) isIdle() bool {
+	if t.laststat == nil {
+		return false
+	}
+
+	return t.laststat.State == int(STAGE_WAIT) || t.laststat.State == int(STAGE_DONE)
+}
+
+func (t *TaskStat) done() bool {
+	return t.laststat.State == int(STAGE_DONE)
 }
 
 type Worker struct {
@@ -260,9 +283,119 @@ func execReducer(reducef func(string, []string) string, t *TaskInfo, id int) {
 	defer file.Close()
 }
 
+type JobMeta struct {
+	t  *TaskInfo
+	tt *TaskStat
+}
+
+func StepMapCtx(ctx context.Context, job JobMeta) error {
+
+	dri := job.tt.driver
+
+	f, err := dri.Open(job.t.FileName)
+
+	if err != nil {
+		return err
+	}
+
+	defer f.Close()
+
+	pos := job.t.StartPos
+	b := make([]byte, 1024*1024*16)
+	result := make(chan []KeyValue, 16)
+
+	for pos < job.t.EndPos {
+		re, err := f.Read(b)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+
+		pos += int64(re)
+
+		go func(x []byte) {
+			kv := job.tt.mapf(string(x))
+			result <- kv
+			x = nil
+		}(b)
+	}
+	b = nil
+	err = MakeTmpBuckets(job, result)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func GetJobTmpName(job JobMeta, idx int) string {
+	bu := new(strings.Builder)
+	binary.Write(bu, binary.BigEndian, job.t.TaskId)
+	bu.Write([]byte("-"))
+	binary.Write(bu, binary.BigEndian, idx)
+	bu.Write([]byte("-"))
+	binary.Write(bu, binary.BigEndian, job.t.MapFileIdx)
+	return bu.String()
+}
+
+func CreateOutline(job JobMeta) ([]*gob.Encoder, error) {
+	files := make([]io.ReadWriteCloser, job.t.NReduce)
+	x := make([]*gob.Encoder, job.t.NReduce)
+	var err error
+	for i := 0; i < job.t.NReduce; i++ {
+		ps := GetJobTmpName(job, i)
+		files[i], err = job.tt.driver.Create(ps)
+		if err != nil {
+			return nil, err
+		}
+		x[i] = gob.NewEncoder(files[i])
+	}
+	return x, nil
+}
+func OpenOutline(job JobMeta) (x []*gob.Encoder, err error) {
+	if job.t.Seq == 0 {
+		x, err = CreateOutline(job)
+		return
+	}
+
+	files := make([]io.ReadWriteCloser, job.t.NReduce)
+	x = make([]*gob.Encoder, job.t.NReduce)
+	for i := 0; i < job.t.NReduce; i++ {
+		ps := GetJobTmpName(job, i)
+		files[i], err = job.tt.driver.Open(ps)
+		if err != nil {
+			return nil, err
+		}
+		x[i] = gob.NewEncoder(files[i])
+	}
+	return
+}
+func MakeTmpBuckets(job JobMeta, src <-chan []KeyValue) error {
+
+	x, err := OpenOutline(job)
+	if err != nil {
+		return err
+	}
+
+	for kvs := range src {
+		for _, v := range kvs {
+			idx := ihash(v.Key)
+			x[idx].Encode(v)
+		}
+	}
+
+	return nil
+}
+
+func StepReduceCtx(ctx context.Context, job JobMeta) error {
+
+}
+
 // 安装执行环境
 func (t *TaskStat) InstallEnv(reply *PongReply) {
-
+	t.Cfg = reply.Config
 	if reply.Driver == "local" {
 		t.driver = NewLocalDriver()
 	}
@@ -299,16 +432,38 @@ func (t *TaskStat) InstallEnv(reply *PongReply) {
 }
 
 // 执行循环
-func (t *TaskStat) Step(xt *TaskInfo) {
-	beg := time.Now()
-	switch xt.State {
-	case 0:
-		execMapper(t.mapf, xt, t.w.WorkerId)
-		fmt.Println("Map stage", xt.MapFileIdx, "--cost:", time.Since(beg))
-	case 1:
-		execReducer(t.reducef, xt, t.w.WorkerId)
-		fmt.Println("Reduce stage", xt.MapFileIdx, "--cost:", time.Since(beg))
+func (t *TaskStat) Step() {
+	for {
+		<-t.next
+		xt := DoRequest(t.w.WorkerId)
+		switch xt.State {
+		case 0:
+			ctx := context.Background()
+			err := StepMapCtx(ctx, JobMeta{
+				t:  xt,
+				tt: t,
+			})
+			if err != nil {
+				log.Println(err)
+			}
+			t.lastidle = time.Now()
+			TaskDone(xt, t.w.WorkerId)
+		case 1:
+			ctx := context.Background()
+			err := StepReduceCtx(ctx, JobMeta{
+				t:  xt,
+				tt: t,
+			})
+			if err != nil {
+				log.Println(err)
+			}
+			t.lastidle = time.Now()
+			TaskDone(xt, t.w.WorkerId)
+		}
+
+		t.laststat = xt
 	}
+
 }
 
 func (t *TaskStat) mapper() {
@@ -391,6 +546,7 @@ func call(addr string, rpcname string, args interface{}, reply interface{}) bool
 	return false
 }
 
+// 注册worker
 func (w *Worker) registerSelf() {
 
 	conn, err := rpc.Dial("tcp", w.DaemonAddr)
@@ -414,12 +570,13 @@ func (w *Worker) registerSelf() {
 	}
 }
 
-func (w *Worker) AskNewTask() {
+// 向daemon申请新的task
+func (w *Worker) AskNewTask() *TaskStat {
 	conn, err := rpc.Dial("tcp", w.DaemonAddr)
 
 	if err != nil {
 		log.Println(err)
-		return
+		return nil
 	}
 	inprogress := []int64{}
 	for _, v := range w.tasks {
@@ -441,5 +598,51 @@ func (w *Worker) AskNewTask() {
 		}
 		t.CallPing(int64(w.WorkerId)) //第一次ping获取执行信息
 		w.tasks = append(w.tasks, t)
+
+		return &t
 	}
+
+	return nil
+}
+
+func (w *Worker) WorkerEntry() {
+	w.registerSelf()
+	go w.WorkerLoop()
+}
+
+func (w *Worker) WorkerLoop() {
+	for {
+		loopactive := 0
+		for idx, v := range w.tasks {
+			// 固定一段时间 poll一下挂起任务
+			maxidle := v.lastidle.Add(maxPolldesc)
+			if maxidle.Before(time.Now()) && v.isIdle() {
+				v.next <- struct{}{}
+				loopactive++
+				continue
+			}
+			// 上一次执行到任务的本轮继续执行
+			if !v.isIdle() {
+				v.next <- struct{}{}
+			}
+			//执行完毕的任务移除
+			if v.done() {
+				close(v.next)
+				w.tasks = append(w.tasks[:idx], w.tasks[idx+1:]...)
+				break
+			}
+			loopactive++
+		}
+		//请求新任务
+		if loopactive <= len(w.tasks)/2 || loopactive <= maxtaskparrel {
+			st := w.AskNewTask()
+			if st == nil {
+				log.Println("ask new task failed")
+			}
+			go st.Step()
+			time.Sleep(1 * time.Second)
+		}
+		loopactive = 0
+	}
+
 }

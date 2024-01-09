@@ -1,14 +1,17 @@
 package common
 
 import (
+	"bytes"
 	"crypto/md5"
 	crand "crypto/rand"
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"gdfs/config"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"hash/crc32"
+	"io"
 	"log"
 	"math/big"
 	"math/rand"
@@ -121,6 +124,11 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 func JoinErrors(errs ...error) error {
+
+	if errs == nil {
+		return nil
+	}
+
 	str := make([]string, len(errs))
 
 	for i, v := range errs {
@@ -146,4 +154,15 @@ func MusOpenLogFile(cc *config.Node) {
 	}
 
 	SetLogger(f)
+}
+
+// 根据指标生成etag
+func GetEtag(metric ...interface{}) string {
+	md5Hash := md5.New()
+	buf := new(bytes.Buffer)
+	for _, i := range metric {
+		binary.Write(buf, binary.BigEndian, i)
+	}
+	io.Copy(md5Hash, buf)
+	return string(md5Hash.Sum(nil))
 }

@@ -4,7 +4,7 @@ import (
 	"gdfs/config"
 	"gdfs/internal/common"
 	"gdfs/internal/master"
-	"gdfs/internal/types"
+	"gdfs/types"
 	"os"
 	"strconv"
 )

@@ -6,9 +6,10 @@ import (
 	"encoding/gob"
 	"gdfs/internal/common"
 	"gdfs/internal/common/rpc"
-	"gdfs/internal/types"
 	"gdfs/internal/wal/raft"
+	"gdfs/types"
 	"log"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 func init() {
 	gob.Register(LogOp{})
+	gob.Register(InvalidApplyMsg{})
 }
 
 type ICommandLet interface {
@@ -28,6 +30,7 @@ type LogOp struct {
 	ClientId int64
 	Seq      int64
 	Region   string // "client" or "internal"
+	SSeq     int64
 	OpType   int
 	Key      string
 	Log      interface{}
@@ -40,6 +43,7 @@ type WaitResult struct {
 
 type SeqResponce struct {
 	Seq  int64
+	SSeq int64
 	Resp WaitResult
 }
 type WriteAheadLog struct {
@@ -53,12 +57,21 @@ type WriteAheadLog struct {
 	applyCh        chan raft.ApplyMsg
 	cmd            ICommandLet
 	LastApplyIndex int
+
+	// non-volatite
+
+	rsu         sync.RWMutex
+	readindex   int
+	readOpinit  int
+	readinitsem *sync.Cond
+	rolechange  <-chan raft.Event
 }
 
 type LogOpLet struct {
 	wal      *WriteAheadLog
 	ClientId int64
 	Seq      int64
+	SSeq     int64
 	Region   string
 }
 
@@ -67,14 +80,20 @@ func NewLogOpLet(wal *WriteAheadLog, ClientId, Seq int64, region string) *LogOpL
 		wal:      wal,
 		ClientId: ClientId,
 		Seq:      Seq,
+		SSeq:     1,
 		Region:   region,
 	}
 }
 
 func (lol *LogOpLet) ChunkStartCtx(ctx context.Context, cmd interface{}) error {
+
+	defer func() {
+		lol.SSeq++
+	}()
 	log := LogOp{
 		ClientId: lol.ClientId,
 		Seq:      lol.Seq,
+		SSeq:     lol.SSeq,
 		Region:   lol.Region,
 		OpType:   types.ChunkLog,
 		Log:      cmd,
@@ -96,10 +115,49 @@ func (lol *LogOpLet) ChunkStartCtx(ctx context.Context, cmd interface{}) error {
 	}
 }
 
-func (lol *LogOpLet) NsStartCtx(ctx context.Context, cmd interface{}) error {
+func (lol *LogOpLet) OpStartCtx(ctx context.Context, cmd interface{}) error {
+	defer func() {
+		lol.SSeq++
+	}()
+
 	log := LogOp{
 		ClientId: lol.ClientId,
 		Seq:      lol.Seq,
+		SSeq:     lol.SSeq,
+		Region:   lol.Region,
+		OpType:   types.BatchLog,
+		Log:      cmd,
+	}
+
+	ch := make(chan error)
+
+	go func() {
+		if err := lol.wal.startCommand(lol.ClientId, lol.Seq, log); err != nil {
+			ch <- err
+		}
+		close(ch)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done(): //context dealine execeed!
+			return ctx.Err()
+		case err := <-ch:
+			return err
+		}
+	}
+}
+
+func (lol *LogOpLet) NsStartCtx(ctx context.Context, cmd interface{}) error {
+
+	defer func() {
+		lol.SSeq++
+	}()
+
+	log := LogOp{
+		ClientId: lol.ClientId,
+		Seq:      lol.Seq,
+		SSeq:     lol.SSeq,
 		Region:   lol.Region,
 		OpType:   types.NsLog,
 		Log:      cmd,
@@ -138,17 +196,27 @@ func (wal *WriteAheadLog) RoleState() (int, bool) {
 func (wal *WriteAheadLog) ServeCommand(msg raft.ApplyMsg) {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
+	var reply WaitResult
+	var err error
+
+	if msg.CommandValid {
+		_, ok := msg.Command.(InvalidApplyMsg)
+		if ok {
+			wal.readOpinit = (msg.CommandTerm << 16) | 1&0xffff
+			wal.readinitsem.Broadcast()
+			wal.LastApplyIndex = msg.CommandIndex
+			return
+		}
+	}
 
 	op := msg.Command.(LogOp)
 	index := msg.CommandIndex
 	common.DPrintf("[S][INFO] Server %v ServeCommand,Index %v", wal.me, msg.CommandIndex)
-	if resp, ok := wal.clientMap[op.ClientId]; ok && resp.Seq >= op.Seq && op.Region != "internal" {
+	if resp, ok := wal.clientMap[op.ClientId]; ok && resp.Seq >= op.Seq && resp.SSeq >= op.SSeq && op.Region != "internal" {
 		return
 	}
-	var reply WaitResult
-	var err error
-	reply.Term = msg.CommandTerm
 
+	reply.Term = msg.CommandTerm
 	err, reply.Err = wal.cmd.ServeApplyCommand(msg)
 	if err != nil {
 		return
@@ -160,6 +228,7 @@ func (wal *WriteAheadLog) ServeCommand(msg raft.ApplyMsg) {
 	if op.Region != "internal" {
 		wal.clientMap[op.ClientId] = SeqResponce{
 			Seq:  op.Seq,
+			SSeq: op.SSeq,
 			Resp: reply,
 		}
 	}
@@ -174,7 +243,7 @@ func (wal *WriteAheadLog) ServeCommand(msg raft.ApplyMsg) {
 func (wal *WriteAheadLog) startCommand(ClientId, Seq int64, cmd interface{}) error {
 	wal.mu.Lock()
 	op := cmd.(LogOp)
-	if resp, ok := wal.clientMap[ClientId]; ok && resp.Seq >= Seq && op.Region != "internal" {
+	if resp, ok := wal.clientMap[ClientId]; ok && resp.Seq >= Seq && resp.SSeq >= op.SSeq && op.Region != "internal" {
 		log.Printf("duplicate request cid %v,seq %v", ClientId, Seq)
 		wal.mu.Unlock()
 		return types.ErrDuplicate
@@ -199,7 +268,7 @@ func (wal *WriteAheadLog) startCommand(ClientId, Seq int64, cmd interface{}) err
 		} else {
 			return resp.Err
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(common.ProposalTimeout):
 		return types.ErrTimeOut
 	}
 }
@@ -314,7 +383,110 @@ func (wal *WriteAheadLog) SubscribeRoleChange(f func(l bool, who int)) {
 
 func (wal *WriteAheadLog) CheckLocalReadStat() bool {
 	_, l := wal.RoleState()
-	return l && wal.rf.HasLeaderLease()
+	return l && wal.JudgeLocalRead()
+}
+
+func (wal *WriteAheadLog) JudgeLocalRead() bool {
+	ctx := context.Background()
+
+	err := wal.ReadIndexInvoker(ctx)
+
+	if err != nil {
+		common.LWarn(" %v", err)
+		return false
+	}
+
+	return true
+}
+
+func (wal *WriteAheadLog) watchloop() {
+	for event := range wal.rolechange {
+		role := event.Arg.(int)
+		if role != raft.Leader {
+			continue
+		}
+		wal.readIndexInit(event.Term)
+	}
+}
+
+func (wal *WriteAheadLog) followerReadIndexInvoker() error {
+	return nil
+}
+
+func (wal *WriteAheadLog) ReadIndexInvoker(ctx context.Context) error {
+	term, ok := wal.rf.GetState()
+
+	if !ok {
+		return wal.followerReadIndexInvoker()
+	}
+
+	wal.waitReadIndexInit(term)
+	common.LInfo("readindex already ready")
+	li := wal.rf.GetCommitIndex()
+	wal.rsu.Lock()
+	wal.readindex = li
+	wal.rsu.Unlock()
+	ctx, h := context.WithTimeout(ctx, common.LoaclReadTimeout)
+	ch := wal.rf.SyncLease()
+	defer h()
+	select {
+	case <-ctx.Done():
+		return types.ErrTimeOut
+	case <-ch:
+	}
+
+	common.LInfo("Readindex synclease over")
+
+	//sl := SpinLock{}
+	count := 1
+
+	wal.mu.Lock()
+
+	for wal.LastApplyIndex < li {
+		wal.mu.Unlock()
+		for i := 0; i < count; i++ {
+			runtime.Gosched()
+		}
+		if count < 8 {
+			count++
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		wal.mu.Lock()
+	}
+	wal.mu.Unlock()
+	common.LInfo("Readindex >= Applyindex")
+	return nil
+}
+
+type InvalidApplyMsg struct{}
+
+// leader 调用
+func (wal *WriteAheadLog) waitReadIndexInit(curTerm int) {
+
+	wal.rsu.Lock()
+	defer wal.rsu.Unlock()
+	for wal.readOpinit>>16 != curTerm || wal.readOpinit&0xffff != 1 {
+		wal.readinitsem.Wait()
+	}
+}
+
+func (wal *WriteAheadLog) readIndexInit(term int) {
+	wal.rsu.Lock()
+	defer wal.rsu.Unlock()
+	// 判断当前term内有没有初始化过readindex
+	if (wal.readOpinit>>16) == term && wal.readOpinit&0xffff == 1 {
+		return
+	}
+	//wal.readOpinit = (term << 16) | 1&0xffff
+
+	initop := InvalidApplyMsg{}
+
+	wal.rf.Start(initop)
 }
 
 func (wal *WriteAheadLog) Getrf() *raft.Raft {
@@ -329,8 +501,11 @@ func StartWalPeer(cmd ICommandLet, servers []*rpc.ClientEnd, me int, persiter ty
 	wal.commitCh = make(map[int]chan WaitResult)
 	wal.rf = raft.Make(servers, me, persiter, wal.applyCh)
 	wal.clientMap = make(map[int64]SeqResponce)
-
+	wal.rolechange = wal.rf.Watch(raft.ROLE_CHANGE)
+	wal.readindex = 0
+	wal.readinitsem = sync.NewCond(&wal.rsu)
 	wal.readSnapShot(persiter.ReadSnapshot())
 	go wal.listen()
+	go wal.watchloop()
 	return wal
 }

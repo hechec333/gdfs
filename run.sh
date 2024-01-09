@@ -29,3 +29,6 @@ go run cmd/main.go -r c -u 3 &
 
 
 echo ">>> finish running gdfs clusters"
+
+
+sleep 3s

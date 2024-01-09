@@ -1,11 +1,11 @@
 package client
 
 import (
-	"gdfs/internal/types"
+	"gdfs/types"
 	"sync"
 )
 
-type FileMode int32
+type FileMode uint8
 
 const (
 	GDFS_RDONLY FileMode = iota << 1
@@ -17,8 +17,17 @@ type File struct {
 	sync.RWMutex
 	c    *Client
 	p    types.Path
-	mode int32
+	mode uint8
 	off  int64
+}
+
+func NewFile(c *Client, path types.Path, mode FileMode) *File {
+	return &File{
+		c:    c,
+		p:    path,
+		mode: uint8(mode),
+		off:  0,
+	}
 }
 
 func (f *File) Close() error {
@@ -34,8 +43,8 @@ func (f *File) Read(p []byte) (n int, err error) {
 
 func (f *File) Write(p []byte) (n int, err error) {
 	f.Lock()
-	defer f.RUnlock()
-	if f.mode&int32(GDFS_APONLY) == int32(GDFS_APONLY) {
+	defer f.Unlock()
+	if f.mode&uint8(GDFS_APONLY) == uint8(GDFS_APONLY) {
 		off, err := f.c.Append(f.p, p)
 		num := off - f.off
 		f.off = off

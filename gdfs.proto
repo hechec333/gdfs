@@ -1,0 +1,55 @@
+syntax="proto3";
+package proto;
+
+option go_package =".;proto";
+message ReadChunkArg {
+    int64 handle = 1;
+    int32 offset = 2;
+    int32 length = 3;
+    string etag = 4;
+}
+  
+message ReadChunkReply {
+    bytes data = 1;
+    int32 length = 2;
+    string etag = 3;
+}
+
+message WriteChunkArg {
+    int64 data_id = 1;
+    int64 offset = 2;
+    repeated string secondaries = 3;
+}
+
+message WriteChunkReply {
+    string etag = 1;
+}
+message AppendChunkArg {
+    int64 data_id = 1;
+    repeated string secondaries = 2;
+}
+message AppendChunkReply {
+    int64 offset = 1;
+    string etag = 2;
+}
+message ForwardOption {
+    bool sync = 1;
+    int32 at_lease_responce = 2;
+    int32 wait = 3;
+}
+message ForwardDataArg {
+	int64 data_id = 1;
+    bytes data = 2;
+    repeated string chain_order = 3;
+    ForwardOption option = 4;
+}
+message ForwardDataReply {
+    int32 repsonce_node = 1;
+}
+
+service ChunkServer {
+    rpc GRPCReadChunk(ReadChunkArg) returns(ReadChunkReply);
+    rpc GRPCWriteChunk(WriteChunkArg) returns(WriteChunkReply);
+    rpc GRPCAppendChunk(AppendChunkArg) returns(AppendChunkReply);
+    rpc GRPCForWardData(ForwardDataArg) returns(ForwardDataReply);
+}
